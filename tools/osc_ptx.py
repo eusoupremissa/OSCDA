@@ -2,6 +2,7 @@
 """Compile PTX from text, a CUDA fatbin, or a CUDA host ELF to AMDGPU."""
 
 import argparse
+import ctypes
 import os
 from pathlib import Path
 import re
@@ -12,6 +13,10 @@ import tempfile
 
 
 FATBIN_MAGIC = 0xBA55ED50
+FATBIN_COMPRESSION_MASK = 0xB000
+FATBIN_LZ4 = 0x2000
+FATBIN_ZSTD = 0x8000
+MAX_PTX_SIZE = 64 * 1024 * 1024
 ELF_SECTION = struct.Struct("<IIQQQQIIQQ")
 
 
@@ -45,10 +50,39 @@ def elf_fatbin(data):
     return checked_slice(data, *candidates[0], "ELF .nv_fatbin section")
 
 
+def decompress_ptx(payload, size, compression):
+    if not 0 < size <= MAX_PTX_SIZE:
+        raise ValueError("invalid decoded PTX size")
+    if compression == FATBIN_LZ4:
+        library = "liblz4.so.1"
+    elif compression == FATBIN_ZSTD:
+        library = "libzstd.so.1"
+    else:
+        raise ValueError(f"unsupported fatbin PTX compression flags 0x{compression:x}")
+    try:
+        codec = ctypes.CDLL(library)
+    except OSError as error:
+        raise ValueError(f"compressed PTX requires {library}: {error}") from error
+
+    output = ctypes.create_string_buffer(size)
+    if compression == FATBIN_LZ4:
+        decompress = codec.LZ4_decompress_safe
+        decompress.argtypes = [ctypes.c_char_p, ctypes.c_void_p, ctypes.c_int, ctypes.c_int]
+        decompress.restype = ctypes.c_int
+        decoded = decompress(payload, output, len(payload), size)
+    else:
+        decompress = codec.ZSTD_decompress
+        decompress.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_char_p, ctypes.c_size_t]
+        decompress.restype = ctypes.c_size_t
+        decoded = decompress(output, size, payload, len(payload))
+    if decoded != size:
+        raise ValueError("invalid compressed PTX data or decoded size mismatch")
+    return output.raw
+
+
 def fatbin_ptx(data):
     position = 0
     image = None
-    compressed = False
     while position < len(data):
         header = checked_slice(data, position, 16, "fatbin header")
         magic, version, header_size, body_size = struct.unpack("<IHHQ", header)
@@ -70,25 +104,27 @@ def fatbin_ptx(data):
                     raise ValueError("invalid fatbin PTX entry")
                 compressed_size = struct.unpack_from("<I", data, position + 16)[0]
                 minor, major = struct.unpack_from("<HH", data, position + 24)
-                if compressed_size > payload_size:
-                    raise ValueError("invalid compressed PTX length")
-                # shortcut: compressed PTX requires a format-specific decoder.
-                if compressed_size:
-                    compressed = True
+                flags = struct.unpack_from("<Q", data, position + 40)[0]
+                compression = flags & FATBIN_COMPRESSION_MASK
+                if image is not None:
+                    raise ValueError("fatbin contains multiple PTX images")
+                if compressed_size or compression:
+                    if (entry_size < 64 or not 0 < compressed_size <= payload_size or
+                            compressed_size > MAX_PTX_SIZE):
+                        raise ValueError("invalid compressed PTX length")
+                    decoded_size = struct.unpack_from("<Q", data, position + 56)[0]
+                    raw = decompress_ptx(data[payload:payload + compressed_size], decoded_size,
+                                         compression)
                 else:
-                    if image is not None:
-                        raise ValueError("fatbin contains multiple uncompressed PTX images")
-                    raw = data[payload:payload + payload_size].rstrip(b"\x00")
-                    ptx = raw.decode("utf-8")
-                    if "\x00" in ptx or not ptx.strip():
-                        raise ValueError("invalid text in fatbin PTX image")
-                    # nvFatbin 12.9 stores the version in metadata and strips the directive.
-                    prefix = re.sub(r"/\*.*?\*/|//[^\n]*", " ", ptx, flags=re.S).lstrip()
-                    image = f".version {major}.{minor}\n{ptx}" if prefix.startswith(".target") else ptx
+                    raw = data[payload:payload + payload_size]
+                ptx = raw.rstrip(b"\x00").decode("utf-8")
+                if "\x00" in ptx or not ptx.strip():
+                    raise ValueError("invalid text in fatbin PTX image")
+                # nvFatbin can move the version directive from the payload to metadata.
+                prefix = re.sub(r"/\*.*?\*/|//[^\n]*", " ", ptx, flags=re.S).lstrip()
+                image = f".version {major}.{minor}\n{ptx}" if prefix.startswith(".target") else ptx
             position = payload + payload_size
     if image is None:
-        if compressed:
-            raise ValueError("fatbin contains compressed PTX; rebuild with compression disabled")
         raise ValueError("fatbin contains no PTX image; a cubin alone cannot be translated")
     return image
 

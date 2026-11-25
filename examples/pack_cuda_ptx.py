@@ -1,11 +1,11 @@
 """Package the vector-add test with NVIDIA nvFatbin without requiring a GPU."""
 
+import argparse
 import ctypes as c
 from pathlib import Path
-import sys
 
 
-def main(library, output):
+def main(library, output, compression):
     lib = c.CDLL(str(Path(library).resolve()))
     handle_type = c.c_void_p
     lib.nvFatbinCreate.argtypes = [c.POINTER(handle_type), c.POINTER(c.c_char_p), c.c_size_t]
@@ -23,7 +23,10 @@ def main(library, output):
             raise SystemExit(lib.nvFatbinGetErrorString(result).decode())
 
     handle = handle_type()
-    options = (c.c_char_p * 1)(b"-compress=false")
+    flags = [b"-compress=false"] if compression == "none" else [
+        b"-compress-all", f"-compress-mode={compression}".encode(),
+    ]
+    options = (c.c_char_p * len(flags))(*flags)
     check(lib.nvFatbinCreate(c.byref(handle), options, 1))
     try:
         source = Path(__file__).with_name("vector_add.ptx").read_bytes() + b"\0"
@@ -38,6 +41,9 @@ def main(library, output):
 
 
 if __name__ == "__main__":
-    if len(sys.argv) != 3:
-        sys.exit("usage: pack_cuda_ptx.py NVFATBIN_LIBRARY OUTPUT.fatbin")
-    main(*sys.argv[1:])
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("library")
+    parser.add_argument("output")
+    parser.add_argument("--compression", choices=["none", "speed", "balance", "size"], default="none")
+    args = parser.parse_args()
+    main(args.library, args.output, args.compression)

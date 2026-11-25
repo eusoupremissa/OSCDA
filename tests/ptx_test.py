@@ -1,3 +1,4 @@
+import ctypes
 import importlib.util
 from pathlib import Path
 import struct
@@ -12,10 +13,12 @@ VECTOR_ADD = (ROOT / "examples/vector_add.ptx").read_text(encoding="utf-8")
 MATMUL = (ROOT / "examples/matmul.ptx").read_text(encoding="utf-8")
 
 
-def fatbin_entry(kind, payload, compressed_size=0):
+def fatbin_entry(kind, payload, compressed_size=0, flags=0, decoded_size=0):
     header = bytearray(88)
     struct.pack_into("<HHIQIIHHI", header, 0, kind, 0x101, len(header), len(payload),
                      compressed_size, len(header) - 16, 0, 7, 70)
+    struct.pack_into("<Q", header, 40, flags)
+    struct.pack_into("<Q", header, 56, decoded_size)
     return bytes(header) + payload
 
 
@@ -39,6 +42,32 @@ def host_elf(payload):
 
 
 class PtxTest(unittest.TestCase):
+    def compressed_ptx(self, codec, flags, payload):
+        try:
+            ctypes.CDLL(codec)
+        except OSError:
+            self.skipTest(f"{codec} unavailable")
+        source = ".target sm_70\n.address_size 64\n.entry sample() { ret; }\n"
+        raw = source.encode() + b"\0"
+        encoded = payload(raw)
+        padding = bytes(-len(encoded) % 8)
+        entry = fatbin_entry(1, encoded + padding, len(encoded), flags, len(raw))
+        image = fatbin(entry)
+        for data in (image, host_elf(image)):
+            self.assertEqual(PTX.read_ptx(data), ".version 7.0\n" + source)
+        invalid = fatbin(fatbin_entry(1, encoded, len(encoded), flags, len(raw) + 1))
+        with self.assertRaisesRegex(ValueError, "decoded size mismatch"):
+            PTX.read_ptx(invalid)
+
+    def test_lz4_ptx(self):
+        self.compressed_ptx("liblz4.so.1", 0x2000,
+                            lambda raw: bytes((0xf0, len(raw) - 15)) + raw)
+
+    def test_zstd_ptx(self):
+        self.compressed_ptx("libzstd.so.1", 0x8000,
+                            lambda raw: b"\x28\xb5\x2f\xfd\x20" + bytes((len(raw),))
+                            + ((len(raw) << 3) | 1).to_bytes(3, "little") + raw)
+
     def test_vector_add(self):
         kernel = PTX.translate(VECTOR_ADD)
         self.assertIn('__asm__("vector_add")', kernel)
@@ -88,9 +117,11 @@ class PtxTest(unittest.TestCase):
             (fatbin(ptx)[:-1], "truncated fatbin body"),
             (fatbin(ptx[:80]), "invalid fatbin entry length"),
             (host_elf(fatbin(ptx))[:-1], "truncated ELF"),
-            (fatbin(ptx, ptx), "multiple uncompressed PTX"),
+            (fatbin(ptx, ptx), "multiple PTX"),
             (fatbin(fatbin_entry(2, b"cubin")), "no PTX"),
-            (fatbin(fatbin_entry(1, b"encoded", 7)), "compressed PTX"),
+            (fatbin(fatbin_entry(1, b"encoded", 8, 0x2000, 16)), "invalid compressed PTX length"),
+            (fatbin(fatbin_entry(1, b"encoded", 7, 0x8000, 1 << 27)), "invalid decoded PTX size"),
+            (fatbin(fatbin_entry(1, b"encoded", 7, 0x1000, 16)), "unsupported fatbin PTX compression"),
         ):
             with self.subTest(error=error), self.assertRaisesRegex(ValueError, error):
                 PTX.read_ptx(data)

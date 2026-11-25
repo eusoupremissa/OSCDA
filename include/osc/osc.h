@@ -5,7 +5,7 @@
 
 #define OSCDA_VERSION_MAJOR 0
 #define OSCDA_VERSION_MINOR 2
-#define OSCDA_VERSION_PATCH 0
+#define OSCDA_VERSION_PATCH 1
 
 #ifdef __cplusplus
 extern "C" {

@@ -1,8 +1,10 @@
 # OSCDA
 
+![OSCDA banner](docs/oscda-banner.png)
+
 OSCDA (Open Source Compute Device Architecture), formerly UniWarp, runs a
 subset of CUDA kernels on AMD GPUs through HIP on Linux. The current project
-version is **0.2.0**. This is an early compatibility runtime and PTX translator.
+version is **0.2.1**. This is an early compatibility runtime and PTX translator.
 
 ## Platform policy
 
@@ -16,11 +18,16 @@ compatibility. Windows results are unverified and are not release criteria.
 Contributors are welcome to audit the code, run individual tests on their own
 Windows systems, and submit pull requests with reproducible results.
 
-## Changes in 0.2.0
+## Changes
+
+**0.2.1** supports LZ4- and Zstandard-compressed PTX in CUDA fatbins, including
+the automatic launch path for CUDA executables with embedded PTX on Linux.
+
+**0.2.0** introduced the following features.
 
 - Added the HIP backend for AMD device discovery, memory, and AMDGPU module
   launches. Retained a deterministic CPU backend for host-side tests.
-- Added `osc-ptx` for text PTX, uncompressed PTX inside CUDA fatbins, and
+- Added `osc-ptx` for text PTX, PTX inside CUDA fatbins, and
   little-endian ELF64 files with a `.nv_fatbin` section.
 - Added translation for scalar arithmetic, direct branches, static shared FP32
   memory, and full-workgroup `bar.sync 0` barriers.
@@ -35,7 +42,8 @@ Windows systems, and submit pull requests with reproducible results.
 Use CMake 3.20+, a C11 compiler, and a build tool. Python 3 enables the PTX
 tests. GPU execution requires the AMDGPU driver, access to `/dev/kfd` and the
 AMD render node under `/dev/dri`, and a working ROCm HIP runtime. Translation
-also requires ROCm LLVM Clang. The reference toolchain is HIP 6.4 and LLVM 19.
+also requires ROCm LLVM Clang. Install `liblz4.so.1` or `libzstd.so.1`
+for the compression formats you use. The reference toolchain is HIP 6.4 and LLVM 19.
 
 ```sh
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
@@ -77,7 +85,7 @@ The translator accepts one textual PTX `.entry` per image with 64-bit
 addressing and scalar arguments. Kernel-local static FP32 arrays map to AMD
 LDS. Every thread in a workgroup must reach each barrier instance. The frontend
 validates branch targets and definite register initialization. Unsupported
-instructions, compressed-only PTX, cubin-only images, and ambiguous fatbins
+instructions, unsupported compression formats, cubin-only images, and ambiguous fatbins
 fail explicitly. See the [PTX ISA](https://docs.nvidia.com/cuda/parallel-thread-execution/index.html)
 and [LLVM AMDGPU guide](https://llvm.org/docs/AMDGPUUsage.html).
 
@@ -88,7 +96,7 @@ CUDA host stub with Clang. NVIDIA's library is required only to build this
 fixture. At runtime OSC extracts and translates the embedded PTX automatically.
 
 ```sh
-python3 examples/pack_cuda_ptx.py /path/to/libnvfatbin.so.12 build/vector_add.fatbin
+python3 examples/pack_cuda_ptx.py /path/to/libnvfatbin.so.12 build/vector_add.fatbin --compression speed
 "$OSC_CLANG" -x cuda --cuda-host-only -nocudainc -nocudalib -std=c++17 -Iinclude \
   -Xclang -target-sdk-version=12.0 -Xclang -fcuda-include-gpubinary \
   -Xclang build/vector_add.fatbin -c examples/cuda_vector_add.cu -o build/cuda_vector_add.o
@@ -97,6 +105,8 @@ OSC_GPU_ARCH=gfx1032 OSC_PTX_TOOL="$PWD/tools/osc_ptx.py" ./build/cuda_vector_ad
 ```
 
 Expected on the RX 6600: two CUDA launches with 4,099 correct results each.
+The LZ4 example above uses nvFatbin 12.9. For Zstandard, use nvFatbin 13.5
+(`libnvfatbin.so.13`) with `--compression balance`.
 The embedded path supports synchronous launches on the default stream.
 `OSC_PYTHON` selects the Python executable when needed. An installed `osc-ptx`
 on PATH can replace `OSC_PTX_TOOL`.
