@@ -1,0 +1,106 @@
+.version 7.0
+.target sm_70
+.address_size 64
+
+.visible .entry matmul(
+    .param .u64 a, .param .u64 b, .param .u64 c,
+    .param .u32 m, .param .u32 n, .param .u32 k
+)
+{
+    .reg .b32 %m;
+    .reg .b32 %n;
+    .reg .b32 %k;
+    .reg .b32 %r<10>;
+    .reg .b64 %d<8>;
+    .reg .f32 %acc;
+    .reg .f32 %left;
+    .reg .f32 %right;
+    .reg .pred %p<3>;
+    .shared .align 4 .f32 tile_a[256];
+    .shared .align 4 .f32 tile_b[256];
+
+    ld.param.u64 %d0, [a];
+    ld.param.u64 %d1, [b];
+    ld.param.u64 %d2, [c];
+    cvta.to.global.u64 %d0, %d0;
+    cvta.to.global.u64 %d1, %d1;
+    cvta.to.global.u64 %d2, %d2;
+    ld.param.u32 %m, [m];
+    ld.param.u32 %n, [n];
+    ld.param.u32 %k, [k];
+    mov.u64 %d3, tile_a;
+    mov.u64 %d4, tile_b;
+
+    mov.u32 %r0, %tid.x;
+    mov.u32 %r1, %tid.y;
+    mov.u32 %r2, %ctaid.x;
+    mad.lo.u32 %r2, %r2, 16, %r0; // col
+    mov.u32 %r3, %ctaid.y;
+    mad.lo.u32 %r3, %r3, 16, %r1; // row
+    mad.lo.u32 %r4, %r1, 16, %r0; // tile offset written by this lane
+    mul.wide.u32 %d5, %r4, 4;
+    setp.ge.u32 %p0, %r3, %m;
+    setp.ge.u32 %p1, %r2, %n;
+    mov.f32 %acc, 0f00000000;
+    mov.u32 %r5, 0;
+
+tile_loop:
+    setp.ge.u32 %p2, %r5, %k;
+    @%p2 bra done_tiles;
+
+    // Every lane publishes both tiles, including zeroes for the ragged edges.
+    mov.f32 %left, 0f00000000;
+    @%p0 bra store_a;
+    add.u32 %r6, %r5, %r0;
+    setp.ge.u32 %p2, %r6, %k;
+    @%p2 bra store_a;
+    mad.lo.u32 %r7, %r3, %k, %r6;
+    mul.wide.u32 %d6, %r7, 4;
+    add.u64 %d6, %d0, %d6;
+    ld.global.f32 %left, [%d6];
+store_a:
+    add.u64 %d6, %d3, %d5;
+    st.shared.f32 [%d6], %left;
+
+    mov.f32 %right, 0f00000000;
+    @%p1 bra store_b;
+    add.u32 %r6, %r5, %r1;
+    setp.ge.u32 %p2, %r6, %k;
+    @%p2 bra store_b;
+    mad.lo.u32 %r7, %r6, %n, %r2;
+    mul.wide.u32 %d6, %r7, 4;
+    add.u64 %d6, %d1, %d6;
+    ld.global.f32 %right, [%d6];
+store_b:
+    add.u64 %d6, %d4, %d5;
+    st.shared.f32 [%d6], %right;
+    bar.sync 0;
+
+    mov.u32 %r8, 0;
+dot:
+    mad.lo.u32 %r9, %r1, 16, %r8;
+    mul.wide.u32 %d6, %r9, 4;
+    add.u64 %d6, %d3, %d6;
+    ld.shared.f32 %left, [%d6];
+    mad.lo.u32 %r9, %r8, 16, %r0;
+    mul.wide.u32 %d7, %r9, 4;
+    add.u64 %d7, %d4, %d7;
+    ld.shared.f32 %right, [%d7];
+    mul.rn.f32 %left, %left, %right;
+    add.rn.f32 %acc, %acc, %left;
+    add.u32 %r8, %r8, 1;
+    setp.ge.u32 %p2, %r8, 16;
+    @!%p2 bra dot;
+    bar.sync 0;
+    add.u32 %r5, %r5, 16;
+    bra.uni tile_loop;
+
+done_tiles:
+    @%p0 ret;
+    @%p1 ret;
+    mad.lo.u32 %r9, %r3, %n, %r2;
+    mul.wide.u32 %d6, %r9, 4;
+    add.u64 %d6, %d2, %d6;
+    st.global.f32 [%d6], %acc;
+    ret;
+}

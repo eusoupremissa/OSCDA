@@ -1,97 +1,123 @@
-# UniWarp
+# OSCDA
 
-UniWarp is an independent, open source GPU compute runtime. Its first compatibility surface follows the CUDA Runtime API. The execution model is meant to run on NVIDIA, AMD, CPUs, and whatever accelerator turns up next with a usable toolchain.
+OSCDA (Open Source Compute Device Architecture), formerly UniWarp, runs a
+subset of CUDA kernels on AMD GPUs through HIP on Linux. The current project
+version is **0.2.0**. This is an early compatibility runtime and PTX translator.
 
-The project is young, which is the honest way of saying that version 0.1 does one thing and tries to do it correctly. It provides a deterministic CPU runtime for host-side CUDA programs, with device discovery, tracked device memory, synchronous and asynchronous copies, memory fills, streams, events, elapsed timing, host callbacks, device synchronization, and thread-local error state.
+## Platform policy
 
-UniWarp does not compile CUDA kernels yet, and it does not claim binary compatibility with NVIDIA libraries. Pretending otherwise would not make either statement true. The boundaries are deliberate, documented, and visible.
+**Linux is the project's sole development and validation target.** The current
+hardware reference is the Radeon RX 6600 (`gfx1032`). Compatibility with other
+AMD GPUs depends on the ROCm runtime, compiler, and kernel features.
 
-## Build
+Windows code and an experimental probe remain available for independent
+testing. A Windows cross-build or a Wine/VM pass does not establish native GPU
+compatibility. Windows results are unverified and are not release criteria.
+Contributors are welcome to audit the code, run individual tests on their own
+Windows systems, and submit pull requests with reproducible results.
+
+## Changes in 0.2.0
+
+- Added the HIP backend for AMD device discovery, memory, and AMDGPU module
+  launches. Retained a deterministic CPU backend for host-side tests.
+- Added `osc-ptx` for text PTX, uncompressed PTX inside CUDA fatbins, and
+  little-endian ELF64 files with a `.nv_fatbin` section.
+- Added translation for scalar arithmetic, direct branches, static shared FP32
+  memory, and full-workgroup `bar.sync 0` barriers.
+- Added automatic registration of compiler-generated CUDA fatbins and launch
+  through `cudaLaunchKernel`. OSC translates on first use and caches the
+  loaded module per device for that process.
+- Added optional HIP diagnostics and regression coverage for invalid tracked
+  memory ranges.
+
+## Build and test on Linux
+
+Use CMake 3.20+, a C11 compiler, and a build tool. Python 3 enables the PTX
+tests. GPU execution requires the AMDGPU driver, access to `/dev/kfd` and the
+AMD render node under `/dev/dri`, and a working ROCm HIP runtime. Translation
+also requires ROCm LLVM Clang. The reference toolchain is HIP 6.4 and LLVM 19.
 
 ```sh
-cmake -S . -B build -G Ninja
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build
 ctest --test-dir build --output-on-failure
 ```
 
-Applications can include `cuda_runtime.h` and link against `libuniwarp`:
+The GPU test is skipped when HIP reports no usable device. Use
+`OSC_HIP_DIAGNOSTICS=1 ./build/amd_runtime_test` to see the native HIP status.
+Set `OSC_HIP_LIBRARY` to test a specific HIP shared library, or
+`OSC_BACKEND=cpu` to force the CPU backend.
+
+Use `#include <osc/osc.h>` for native OSC APIs or `#include <cuda_runtime.h>`
+for the compatibility subset. Link with `-losc`. To install the library,
+headers, and `osc-ptx`:
 
 ```sh
-cc program.c -Iinclude -Lbuild -luniwarp -Wl,-rpath,build
+cmake --install build --prefix /path/to/prefix
 ```
 
-## Current surface
+## Run a translated kernel
 
-The runtime currently supports exactly this:
+Set `OSC_CLANG` to the ROCm compiler if it is outside PATH. Replace
+`gfx1032` with the target reported by `amdgpu-arch` for your GPU.
 
-* One deterministic CPU device
-* `cudaMalloc`, `cudaFree`, `cudaMallocHost`, and `cudaFreeHost`
-* Tracked pointer ranges and copy direction validation
-* `cudaMemcpy`, `cudaMemcpyAsync`, `cudaMemset`, and `cudaMemsetAsync`
-* Ordered streams backed by independent worker threads
-* Events, queries, synchronization, and elapsed time
-* Ordered host callbacks
-* Device wide synchronization
-* Per-thread last error state
-
-The CPU device is a correctness backend, not a benchmark prop. Device allocations remain opaque through the public API but are host allocations internally. Host callbacks make stream ordering and memory semantics testable before a kernel compiler exists, because debugging all of that after adding a compiler would be a remarkably avoidable mistake.
-
-## Architecture
-
-UniWarp follows four boundaries:
-
-```text
-CUDA source and runtime calls
-            |
-    CUDA compatible frontend
-            |
-      UniWarp module IR
-            |
-   Backend execution contract
-       /       |       \
-     CPU     ROCm    NVIDIA
+```sh
+export OSC_CLANG=/path/to/rocm/llvm/bin/clang++
+python3 tools/osc_ptx.py examples/vector_add.ptx --arch gfx1032 -o build/vector_add.hsaco
+./build/amd_vector_add build/vector_add.hsaco
+python3 tools/osc_ptx.py examples/matmul.ptx --arch gfx1032 -o build/matmul.hsaco
+./build/amd_matmul build/matmul.hsaco
 ```
 
-Only the runtime and CPU execution core exist today. The backend interface will be extracted when the ROCm backend lands. Creating it earlier would merely promote guesses to architecture, a surprisingly popular way to make software worse.
+The vector test compares 4,099 results and checks the last block's padding.
+The tiled matrix test compares 2,097 FP32 outputs against CPU results across
+aligned and irregular dimensions. Both were validated on the RX 6600.
 
-The compiler path will accept CUDA C++ through Clang, retain PTX as an input format, and lower kernels into a versioned UniWarp IR. Native backends can then select LLVM AMDGPU, SPIR-V, PTX, or another machine-specific route. The IR must preserve address spaces, barriers, warp operations, memory ordering, and floating-point intent before it gets clever with optimization. Fast nonsense is still nonsense.
+The translator accepts one textual PTX `.entry` per image with 64-bit
+addressing and scalar arguments. Kernel-local static FP32 arrays map to AMD
+LDS. Every thread in a workgroup must reach each barrier instance. The frontend
+validates branch targets and definite register initialization. Unsupported
+instructions, compressed-only PTX, cubin-only images, and ambiguous fatbins
+fail explicitly. See the [PTX ISA](https://docs.nvidia.com/cuda/parallel-thread-execution/index.html)
+and [LLVM AMDGPU guide](https://llvm.org/docs/AMDGPUUsage.html).
 
-## Engineering rules
+## Run a CUDA executable with embedded PTX
 
-1. Correctness precedes coverage.
-2. Compatibility claims require executable tests.
-3. Public interfaces are stable only after two real backends use them.
-4. The runtime owns ordering, lifetime, and error semantics.
-5. Backends own code generation, queues, and device memory.
-6. Vendor quirks remain isolated and named.
-7. Unsupported behavior fails explicitly.
-8. Dependencies must earn their place in the hot path.
+This example embeds the supplied PTX with NVIDIA's `nvFatbin` and compiles the
+CUDA host stub with Clang. NVIDIA's library is required only to build this
+fixture. At runtime OSC extracts and translates the embedded PTX automatically.
 
-## Prior art
+```sh
+python3 examples/pack_cuda_ptx.py /path/to/libnvfatbin.so.12 build/vector_add.fatbin
+"$OSC_CLANG" -x cuda --cuda-host-only -nocudainc -nocudalib -std=c++17 -Iinclude \
+  -Xclang -target-sdk-version=12.0 -Xclang -fcuda-include-gpubinary \
+  -Xclang build/vector_add.fatbin -c examples/cuda_vector_add.cu -o build/cuda_vector_add.o
+c++ build/cuda_vector_add.o -Lbuild -Wl,-rpath,"$PWD/build" -losc -o build/cuda_vector_add
+OSC_GPU_ARCH=gfx1032 OSC_PTX_TOOL="$PWD/tools/osc_ptx.py" ./build/cuda_vector_add
+```
 
-UniWarp studies existing systems instead of pretending GPU computing began with this repository:
+Expected on the RX 6600: two CUDA launches with 4,099 correct results each.
+The embedded path supports synchronous launches on the default stream.
+`OSC_PYTHON` selects the Python executable when needed. An installed `osc-ptx`
+on PATH can replace `OSC_PTX_TOOL`.
 
-* [ROCm HIP](https://github.com/ROCm/HIP) demonstrates a practical CUDA shaped portability API and a clean route to AMD hardware.
-* [chipStar](https://github.com/CHIP-SPV/chipStar) demonstrates CUDA and HIP execution through SPIR-V with OpenCL and Level Zero backends.
-* [GPUOcelot](https://github.com/gpuocelot/gpuocelot) demonstrates PTX parsing, a formal intermediate representation, CPU emulation, dynamic translation, and correctness tooling.
-* [ZLUDA](https://github.com/vosen/ZLUDA) demonstrates drop-in CUDA driver translation and the operational difficulty of mapping vendor specific behavior.
-* [LLVM](https://github.com/llvm/llvm-project) provides the compiler infrastructure needed for serious CUDA, AMDGPU, and SPIR-V work.
+OSC implements the registration path observed in NVIDIA's CUDA runtime and
+in [Clang's CUDA code generation](https://clang.llvm.org/doxygen/CGCUDANV_8cpp_source.html).
+For a manual launch, use `oscModuleLoad`, `oscModuleGetFunction`, and
+`oscLaunchKernel` with a compiled AMDGPU code object.
 
-No source code from the NVIDIA CUDA SDK is included. Code from other projects enters UniWarp only through deliberate reuse with compatible licenses, attribution, and tests. Copy-paste is not an architecture and copyright is not an optional compiler warning.
+## Compatibility limits
 
-## Roadmap
+The runtime implements a subset of CUDA host APIs. CUDA C++ device compilation,
+SASS translation, general CUDA binary compatibility, CUDA graphs, and NVIDIA
+libraries such as cuBLAS and cuDNN are outside the current scope. PyTorch CUDA
+wheels and applications such as RVC have not been validated with OSCDA.
 
-The next milestones are ordered by dependency, not by which one looks best in an announcement:
+## Contributing
 
-1. Lock down runtime semantics with adversarial stream and memory tests.
-2. Add a real backend contract and a ROCm implementation.
-3. Load versioned modules and launch precompiled AMDGPU kernels.
-4. Parse a strict, useful PTX subset into a typed control flow graph.
-5. Execute that subset in the deterministic CPU backend.
-6. Lower the same IR to LLVM AMDGPU.
-7. Add a Clang based CUDA compiler driver.
-8. Grow API and library coverage from real applications.
+Use a pull request for changes. For GPU results, include the GPU and target ID,
+OS and driver versions, HIP and Clang versions, exact commands, and logs.
+Keep platform-specific results separate from Linux validation.
 
-## Independence
-
-UniWarp is not affiliated with, sponsored by, or endorsed by NVIDIA or AMD. CUDA is a trademark of NVIDIA Corporation. Other names belong to their respective owners.
+OSCDA is independent of AMD and NVIDIA. CUDA is an NVIDIA trademark.
+Released under the [MIT License](LICENSE).

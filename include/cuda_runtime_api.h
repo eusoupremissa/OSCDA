@@ -1,10 +1,10 @@
-#ifndef UNIWARP_CUDA_RUNTIME_API_H
-#define UNIWARP_CUDA_RUNTIME_API_H
+#ifndef OSCDA_CUDA_RUNTIME_API_H
+#define OSCDA_CUDA_RUNTIME_API_H
 
 #include <stddef.h>
 
 #if defined(_WIN32)
-#if defined(UNI_WARP_BUILD)
+#if defined(OSCDA_BUILD)
 #define CUDARTAPI __declspec(dllexport)
 #else
 #define CUDARTAPI __declspec(dllimport)
@@ -14,6 +14,14 @@
 #define CUDARTAPI __attribute__((visibility("default")))
 #define CUDART_CB
 #endif
+
+typedef struct dim3 {
+    unsigned int x, y, z;
+#ifdef __cplusplus
+    constexpr dim3(unsigned int x = 1, unsigned int y = 1, unsigned int z = 1)
+        : x(x), y(y), z(z) {}
+#endif
+} dim3;
 
 #ifdef __cplusplus
 extern "C" {
@@ -40,8 +48,8 @@ typedef enum cudaMemcpyKind {
     cudaMemcpyDefault = 4
 } cudaMemcpyKind;
 
-typedef struct uw_stream *cudaStream_t;
-typedef struct uw_event *cudaEvent_t;
+typedef struct osc_stream *cudaStream_t;
+typedef struct osc_event *cudaEvent_t;
 typedef void(CUDART_CB *cudaHostFn_t)(void *userData);
 
 enum {
@@ -99,6 +107,16 @@ CUDARTAPI cudaError_t cudaStreamSynchronize(cudaStream_t stream);
 CUDARTAPI cudaError_t cudaStreamQuery(cudaStream_t stream);
 CUDARTAPI cudaError_t cudaStreamGetFlags(cudaStream_t stream, unsigned int *flags);
 CUDARTAPI cudaError_t cudaLaunchHostFunc(cudaStream_t stream, cudaHostFn_t fn, void *userData);
+CUDARTAPI cudaError_t cudaLaunchKernel(const void *function, dim3 grid, dim3 block,
+                                    void **arguments, size_t shared, cudaStream_t stream);
+CUDARTAPI unsigned int __cudaPushCallConfiguration(dim3 grid, dim3 block,
+#ifdef __cplusplus
+                                                   size_t shared = 0, cudaStream_t stream = nullptr);
+#else
+                                                   size_t shared, cudaStream_t stream);
+#endif
+CUDARTAPI cudaError_t __cudaPopCallConfiguration(dim3 *grid, dim3 *block,
+                                                size_t *shared, void *stream);
 
 CUDARTAPI cudaError_t cudaEventCreate(cudaEvent_t *event);
 CUDARTAPI cudaError_t cudaEventCreateWithFlags(cudaEvent_t *event, unsigned int flags);

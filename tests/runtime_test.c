@@ -1,5 +1,6 @@
 #include <cuda_runtime.h>
 
+#undef NDEBUG
 #include <assert.h>
 #include <stdio.h>
 
@@ -51,6 +52,10 @@ int main(void)
     check(cudaMalloc((void **)&device_a, sizeof(a)));
     check(cudaMalloc((void **)&device_b, sizeof(b)));
     check(cudaMalloc((void **)&device_out, sizeof(out)));
+    assert(cudaMemcpy(device_a + ELEMENTS - 1, a, sizeof(float) * 2, cudaMemcpyDefault) ==
+           cudaErrorInvalidValue);
+    assert(cudaMemcpyAsync(out, device_a + ELEMENTS - 1, sizeof(float) * 2,
+                           cudaMemcpyDefault, NULL) == cudaErrorInvalidValue);
 
     cudaStream_t stream;
     cudaEvent_t start;
@@ -85,6 +90,6 @@ int main(void)
     check(cudaFree(device_out));
     check(cudaFree(device_b));
     check(cudaFree(device_a));
-    puts("UniWarp runtime test passed");
+    puts("OSC CPU runtime test passed");
     return 0;
 }
