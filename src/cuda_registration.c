@@ -22,6 +22,8 @@ extern char **environ;
 #endif
 
 cudaError_t osc_result(cudaError_t error);
+cudaError_t osc_launch_kernel(oscFunction_t function, dim3 grid, dim3 block,
+                              unsigned int shared, void **arguments, cudaStream_t stream);
 
 struct fatbin_wrapper {
     uint32_t magic, version;
@@ -287,17 +289,13 @@ cudaError_t cudaLaunchKernel(const void *function, dim3 grid, dim3 block, void *
     if (!function || !grid.x || !grid.y || !grid.z || !block.x || !block.y || !block.z ||
         shared > UINT_MAX)
         return osc_result(cudaErrorInvalidValue);
-    if (stream || oscGetBackend() != oscBackendAmdHip)
+    if (oscGetBackend() != oscBackendAmdHip)
         return osc_result(cudaErrorNotSupported);
 
     int device;
     cudaError_t result = cudaGetDevice(&device);
     if (result != cudaSuccess)
         return result;
-    result = cudaDeviceSynchronize();
-    if (result != cudaSuccess)
-        return result;
-
     pthread_mutex_lock(&registry_lock);
     struct registered_kernel *kernel = kernels;
     while (kernel && kernel->host_stub != function)
@@ -323,8 +321,7 @@ cudaError_t cudaLaunchKernel(const void *function, dim3 grid, dim3 block, void *
             oscFunction_t native;
             result = oscModuleGetFunction(&native, loaded->module, kernel->name);
             if (result == cudaSuccess)
-                result = oscLaunchKernel(native, grid.x, grid.y, grid.z, block.x, block.y, block.z,
-                                         (unsigned int)shared, arguments);
+                result = osc_launch_kernel(native, grid, block, (unsigned int)shared, arguments, stream);
         }
         if (kernel->owner->modules && !module_cleanup_installed) {
             // Constructors register CUDA exit hooks before HIP initializes.
@@ -337,6 +334,8 @@ cudaError_t cudaLaunchKernel(const void *function, dim3 grid, dim3 block, void *
         }
     }
     pthread_mutex_unlock(&registry_lock);
+    if (!stream && result == cudaSuccess)
+        return cudaStreamSynchronize(NULL);
     return osc_result(result);
 }
 

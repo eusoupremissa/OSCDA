@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.20)
 
-project(OSCDA VERSION 0.2.1 LANGUAGES C)
+project(OSCDA VERSION 0.2.2 LANGUAGES C)
 
 include(GNUInstallDirs)
 include(CTest)

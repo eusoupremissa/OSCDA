@@ -4,7 +4,7 @@
 
 OSCDA (Open Source Compute Device Architecture), formerly UniWarp, runs a
 subset of CUDA kernels on AMD GPUs through HIP on Linux. The current project
-version is **0.2.1**. This is an early compatibility runtime and PTX translator.
+version is **0.2.2**. This is an early compatibility runtime and PTX translator.
 
 ## Platform policy
 
@@ -19,6 +19,11 @@ Contributors are welcome to audit the code, run individual tests on their own
 Windows systems, and submit pull requests with reproducible results.
 
 ## Changes
+
+**0.2.2** submits CUDA kernel launches on explicit streams to native HIP
+queues. Copies, fills, callbacks, and events share the same queue ordering.
+The Linux RX 6600 test verifies that one stream can finish while another is
+held, and checks 4,099 results from each stream.
 
 **0.2.1** supports LZ4- and Zstandard-compressed PTX in CUDA fatbins, including
 the automatic launch path for CUDA executables with embedded PTX on Linux.
@@ -107,7 +112,11 @@ OSC_GPU_ARCH=gfx1032 OSC_PTX_TOOL="$PWD/tools/osc_ptx.py" ./build/cuda_vector_ad
 Expected on the RX 6600: two CUDA launches with 4,099 correct results each.
 The LZ4 example above uses nvFatbin 12.9. For Zstandard, use nvFatbin 13.5
 (`libnvfatbin.so.13`) with `--compression balance`.
-The embedded path supports synchronous launches on the default stream.
+Default-stream launches remain synchronous. With an explicit stream, the
+launch returns after submission. The first launch can still spend time
+translating and loading the embedded module. Use `cudaStreamSynchronize`
+or an event to wait for completion. On HIP, `cudaMallocHost` provides pinned
+buffers for asynchronous host and device transfers.
 `OSC_PYTHON` selects the Python executable when needed. An installed `osc-ptx`
 on PATH can replace `OSC_PTX_TOOL`.
 
@@ -115,6 +124,23 @@ OSC implements the registration path observed in NVIDIA's CUDA runtime and
 in [Clang's CUDA code generation](https://clang.llvm.org/doxygen/CGCUDANV_8cpp_source.html).
 For a manual launch, use `oscModuleLoad`, `oscModuleGetFunction`, and
 `oscLaunchKernel` with a compiled AMDGPU code object.
+
+### Validate two CUDA streams
+
+Reuse the compressed `build/vector_add.fatbin` from the previous example:
+
+```sh
+"$OSC_CLANG" -x cuda --cuda-host-only -nocudainc -nocudalib -std=c++17 -Iinclude \
+  -Xclang -target-sdk-version=12.0 -Xclang -fcuda-include-gpubinary \
+  -Xclang build/vector_add.fatbin -c examples/cuda_two_streams.cu -o build/cuda_two_streams.o
+c++ build/cuda_two_streams.o -Lbuild -Wl,-rpath,"$PWD/build" -losc -pthread -o build/cuda_two_streams
+OSC_GPU_ARCH=gfx1032 OSC_PTX_TOOL="$PWD/tools/osc_ptx.py" ./build/cuda_two_streams
+```
+
+The program holds a non-blocking stream with a host callback and waits for
+the second stream's event before releasing the first. It then checks both
+outputs. This verifies independent progress and ordering, without requiring
+that the GPU execute two kernels simultaneously.
 
 ## Compatibility limits
 
