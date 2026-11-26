@@ -2,6 +2,11 @@
 
 ![OSCDA banner](docs/oscda-banner.png)
 
+> [!IMPORTANT]
+> **OSCDA is extremely experimental.** If you want a practical, working solution
+> for running existing CUDA applications on non-NVIDIA GPUs, we strongly
+> recommend [ZLUDA](https://github.com/vosen/ZLUDA).
+
 OSCDA (Open Source Compute Device Architecture), formerly UniWarp, runs a
 subset of CUDA kernels on AMD GPUs through HIP on Linux. The current project
 version is **0.2.2**. This is an early compatibility runtime and PTX translator.
