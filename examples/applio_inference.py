@@ -31,6 +31,10 @@ def use_torch_hip_library():
     return library
 
 
+class Dim3(c.Structure):
+    _fields_ = [(axis, c.c_uint) for axis in "xyz"]
+
+
 class OscRelu:
     def __init__(self, torch, library, bridge, device, build_directory):
         self.torch = torch
@@ -41,9 +45,9 @@ class OscRelu:
         signatures = [
             (self.runtime.cudaGetErrorName, [c.c_int], c.c_char_p),
             (self.runtime.oscGetDeviceArch, [c.c_int, c.c_char_p, c.c_size_t], c.c_int),
-            (self.bridge.oscda_relu_load, [c.c_char_p, c.POINTER(ptr)], c.c_int),
-            (self.bridge.oscda_relu_launch, [ptr, c.c_uint64, c.c_uint64, c.c_uint64, ptr], c.c_int),
-            (self.bridge.oscda_relu_unload, [ptr], c.c_int),
+            (self.bridge.oscda_kernel_load, [c.c_char_p, c.c_char_p, c.POINTER(ptr)], c.c_int),
+            (self.bridge.oscda_kernel_launch, [ptr, Dim3, Dim3, c.c_uint, c.POINTER(ptr), ptr], c.c_int),
+            (self.bridge.oscda_kernel_unload, [ptr], c.c_int),
         ]
         for function, arguments, result in signatures:
             function.argtypes = arguments
@@ -57,7 +61,7 @@ class OscRelu:
              "--arch", self.arch, "-o", str(code)], check=True,
         )
         self.kernel = ptr()
-        self.check(self.bridge.oscda_relu_load, os.fsencode(code), c.byref(self.kernel))
+        self.check(self.bridge.oscda_kernel_load, os.fsencode(code), b"applio_relu", c.byref(self.kernel))
 
     def check(self, function, *args):
         status = function(*args)
@@ -66,16 +70,22 @@ class OscRelu:
             raise RuntimeError(f"{function.__name__} returned {error} ({status})")
 
     def close(self):
-        self.check(self.bridge.oscda_relu_unload, self.kernel)
+        self.check(self.bridge.oscda_kernel_unload, self.kernel)
 
     def __call__(self, x):
         if x.dtype != self.torch.float32 or not x.is_cuda or not x.is_contiguous():
             raise RuntimeError("OSCDA ReLU requires a contiguous FP32 HIP tensor")
+        if not 0 < x.numel() <= 0xFFFFFFFF:
+            raise RuntimeError("OSCDA ReLU requires a nonempty tensor with at most 2**32 - 1 elements")
         y = self.torch.empty_like(x)
         stream = self.torch.cuda.current_stream(x.device)
         x.record_stream(stream)
-        self.check(self.bridge.oscda_relu_launch, self.kernel, x.data_ptr(), y.data_ptr(),
-                   x.numel(), stream.cuda_stream)
+        values = (c.c_uint64(x.data_ptr()), c.c_uint64(y.data_ptr()), c.c_uint32(x.numel()))
+        arguments = (c.c_void_p * len(values))(*(c.addressof(value) for value in values))
+        threads = 256
+        grid = Dim3((x.numel() + threads - 1) // threads, 1, 1)
+        self.check(self.bridge.oscda_kernel_launch, self.kernel, grid, Dim3(threads, 1, 1),
+                   0, arguments, stream.cuda_stream)
         self.launches += 1
         return y
 

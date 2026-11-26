@@ -1,21 +1,20 @@
-//! HIP tensor interop for the OSCDA inference example.
+//! Load and launch AMDGPU code objects on streams borrowed from HIP.
 
 use std::ffi::{CStr, c_char, c_int, c_uint, c_void};
 use std::ptr::{NonNull, null_mut};
 
 const INVALID_VALUE: c_int = 1;
 const INITIALIZATION_ERROR: c_int = 3;
-const BLOCK_SIZE: c_uint = 256;
 
 #[repr(C)]
-struct Dim3 {
-    x: c_uint,
-    y: c_uint,
-    z: c_uint,
+pub struct Dim3 {
+    pub x: c_uint,
+    pub y: c_uint,
+    pub z: c_uint,
 }
 
 impl Dim3 {
-    fn linear(x: c_uint) -> Self {
+    pub fn linear(x: c_uint) -> Self {
         Self { x, y: 1, z: 1 }
     }
 }
@@ -76,108 +75,128 @@ impl Drop for Module {
     }
 }
 
-pub struct ReluKernel {
+mod legacy_relu;
+pub use legacy_relu::{ReluKernel, oscda_relu_launch, oscda_relu_load, oscda_relu_unload};
+
+/// A kernel and the loaded module that owns its function handle.
+pub struct Kernel {
     module: Module,
     function: NonNull<c_void>,
 }
 
-fn geometry(elements: u64) -> Result<(c_uint, c_uint), c_int> {
-    let count = c_uint::try_from(elements).map_err(|_| INVALID_VALUE)?;
-    if count == 0 {
-        return Err(INVALID_VALUE);
+impl Kernel {
+    /// Load an AMDGPU code object and resolve one entry point.
+    ///
+    /// # Safety
+    /// Keep the same HIP device selected when launching or dropping this kernel.
+    pub unsafe fn load(path: &CStr, symbol: &CStr) -> Result<Self, c_int> {
+        let module = Module::load(path)?;
+        let function = module.kernel(symbol)?;
+        Ok(Self { module, function })
     }
-    Ok((count, count.div_ceil(BLOCK_SIZE)))
+
+    /// Enqueue work on a borrowed HIP stream. Null selects the HIP default stream.
+    ///
+    /// # Safety
+    /// Arguments must match the device kernel signature. The HIP device and runtime
+    /// must own the stream and any device buffers, which must outlive the queued work.
+    pub unsafe fn launch(
+        &self,
+        grid: Dim3,
+        block: Dim3,
+        shared: c_uint,
+        arguments: &mut [*mut c_void],
+        stream: *mut c_void,
+    ) -> Result<(), c_int> {
+        let arguments = if arguments.is_empty() {
+            null_mut()
+        } else {
+            arguments.as_mut_ptr()
+        };
+        status(unsafe { self.launch_raw(grid, block, shared, arguments, stream) })
+    }
+
+    unsafe fn launch_raw(
+        &self,
+        grid: Dim3,
+        block: Dim3,
+        shared: c_uint,
+        arguments: *mut *mut c_void,
+        stream: *mut c_void,
+    ) -> c_int {
+        unsafe {
+            oscLaunchKernelOnHipStream(
+                self.function.as_ptr(),
+                grid,
+                block,
+                shared,
+                arguments,
+                stream,
+            )
+        }
+    }
+
+    /// Synchronize and unload, reporting any HIP error.
+    pub fn close(mut self) -> Result<(), c_int> {
+        status(self.module.unload())
+    }
 }
 
-/// Load the translated ReLU code object for the current HIP device.
+/// Load a named kernel for the current HIP device.
 ///
 /// # Safety
-/// `path` must be a valid C string. `out` must be writable and must not hold
-/// a live kernel. Keep the same HIP device selected for launch and unload.
+/// Both strings must be valid. The output must be writable and must not hold
+/// a live kernel. Keep the device selected for launches and unload.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn oscda_relu_load(path: *const c_char, out: *mut *mut ReluKernel) -> c_int {
-    if path.is_null() || out.is_null() {
+pub unsafe extern "C" fn oscda_kernel_load(
+    path: *const c_char,
+    symbol: *const c_char,
+    out: *mut *mut Kernel,
+) -> c_int {
+    if path.is_null() || symbol.is_null() || out.is_null() {
         return INVALID_VALUE;
     }
     unsafe { out.write(null_mut()) };
-    let module = match Module::load(unsafe { CStr::from_ptr(path) }) {
-        Ok(module) => module,
-        Err(error) => return error,
-    };
-    let function = match module.kernel(c"applio_relu") {
-        Ok(function) => function,
-        Err(error) => return error,
-    };
-    unsafe { out.write(Box::into_raw(Box::new(ReluKernel { module, function }))) };
-    0
+    match unsafe { Kernel::load(CStr::from_ptr(path), CStr::from_ptr(symbol)) } {
+        Ok(kernel) => {
+            unsafe { out.write(Box::into_raw(Box::new(kernel))) };
+            0
+        }
+        Err(error) => error,
+    }
 }
 
-/// Enqueue FP32 ReLU without copying tensors or synchronizing the stream.
+/// Enqueue a named kernel on a HIP stream owned by the caller.
 ///
 /// # Safety
-/// `kernel` must be live. Buffers must hold `elements` contiguous FP32 values
-/// on the selected device and remain alive until the work completes. The
-/// borrowed stream and buffers must belong to the HIP runtime used to load
-/// the module. The caller must serialize against unloading the kernel.
+/// The handle must be live, the argument array must match the entry point ABI,
+/// and the stream and buffers must belong to the current HIP runtime and device.
+/// Keep buffers and the stream alive until the queued work completes.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn oscda_relu_launch(
-    kernel: *const ReluKernel,
-    mut input: u64,
-    mut output: u64,
-    elements: u64,
+pub unsafe extern "C" fn oscda_kernel_launch(
+    kernel: *const Kernel,
+    grid: Dim3,
+    block: Dim3,
+    shared: c_uint,
+    arguments: *mut *mut c_void,
     stream: *mut c_void,
 ) -> c_int {
-    let Some(kernel) = (unsafe { kernel.as_ref() }) else {
-        return INVALID_VALUE;
-    };
-    if input == 0 || output == 0 {
-        return INVALID_VALUE;
-    }
-    let (mut count, blocks) = match geometry(elements) {
-        Ok(geometry) => geometry,
-        Err(error) => return error,
-    };
-    let mut arguments = [
-        (&raw mut input).cast::<c_void>(),
-        (&raw mut output).cast::<c_void>(),
-        (&raw mut count).cast::<c_void>(),
-    ];
-    unsafe {
-        oscLaunchKernelOnHipStream(
-            kernel.function.as_ptr(),
-            Dim3::linear(blocks),
-            Dim3::linear(BLOCK_SIZE),
-            0,
-            arguments.as_mut_ptr(),
-            stream,
-        )
+    match unsafe { kernel.as_ref() } {
+        Some(kernel) => unsafe { kernel.launch_raw(grid, block, shared, arguments, stream) },
+        None => INVALID_VALUE,
     }
 }
 
-/// Unload a kernel created by `oscda_relu_load`.
+/// Unload a kernel from the current HIP device.
 ///
 /// # Safety
-/// Pass a valid, uniquely owned kernel once, on the same HIP device. No other
-/// thread may use the handle during or after this call.
+/// Pass one uniquely owned kernel returned by oscda_kernel_load. Do not use
+/// the handle again or allow another thread to use it during this call.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn oscda_relu_unload(kernel: *mut ReluKernel) -> c_int {
+pub unsafe extern "C" fn oscda_kernel_unload(kernel: *mut Kernel) -> c_int {
     if kernel.is_null() {
         return INVALID_VALUE;
     }
-    let mut kernel = unsafe { Box::from_raw(kernel) };
-    kernel.module.unload()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn geometry_covers_tail_without_overflow() {
-        assert_eq!(geometry(0), Err(INVALID_VALUE));
-        assert_eq!(geometry(256), Ok((256, 1)));
-        assert_eq!(geometry(257), Ok((257, 2)));
-        assert_eq!(geometry(u64::from(u32::MAX)), Ok((u32::MAX, 16_777_216)));
-        assert_eq!(geometry(u64::from(u32::MAX) + 1), Err(INVALID_VALUE));
-    }
+    let kernel = unsafe { Box::from_raw(kernel) };
+    kernel.close().err().unwrap_or(0)
 }

@@ -7,9 +7,16 @@
 > for running existing CUDA applications on non-NVIDIA GPUs, we strongly
 > recommend [ZLUDA](https://github.com/vosen/ZLUDA).
 
-OSCDA (Open Source Compute Device Architecture), formerly UniWarp, runs a
-subset of CUDA kernels on AMD GPUs through HIP on Linux. The current project
-version is **0.2.4**. This is an early compatibility runtime and PTX translator.
+OSCDA (Open Source Compute Device Architecture), formerly UniWarp, is an
+experimental CUDA compatibility runtime and PTX translator for AMD GPUs on
+Linux. It is intended for any application whose kernels and runtime
+requirements fit the supported subset. The current version is **0.2.5**.
+
+The [Rust HIP interface](rust/oscda-hip/README.md) loads named kernels from
+AMDGPU code objects and launches them on streams owned by the application or
+its framework. Applio served as an integration test for real AI inference.
+The standalone Rust vector-add example exercises the same interface without
+an application framework.
 
 ## Platform policy
 
@@ -24,6 +31,13 @@ Contributors are welcome to audit the code, run individual tests on their own
 Windows systems, and submit pull requests with reproducible results.
 
 ## Changes
+
+**0.2.5** exposes a general Rust API and C ABI for loading and launching named
+AMDGPU kernels with caller-supplied arguments, grid and block dimensions,
+dynamic shared memory, and a borrowed HIP stream. The original ReLU ABI is
+still available. On the RX 6600, the standalone Rust example matched all
+4,099 CPU results, and Applio matched all 281,600 samples of the native ROCm
+reference using the same general interface.
 
 **0.2.4** adds a Rust bridge for running translated PTX kernels on tensors and
 streams owned by PyTorch ROCm. LLVM generates AMDGPU code objects as before.
