@@ -5,7 +5,7 @@
 
 #define OSCDA_VERSION_MAJOR 0
 #define OSCDA_VERSION_MINOR 2
-#define OSCDA_VERSION_PATCH 2
+#define OSCDA_VERSION_PATCH 3
 
 #ifdef __cplusplus
 extern "C" {
@@ -22,6 +22,8 @@ typedef struct osc_function *oscFunction_t;
 CUDARTAPI const char *oscGetRuntimeName(void);
 CUDARTAPI oscBackend_t oscGetBackend(void);
 CUDARTAPI const char *oscGetBackendName(void);
+/* Reports the HIP target ID of a device, including any target features. */
+CUDARTAPI cudaError_t oscGetDeviceArch(int device, char *arch, size_t capacity);
 
 /* Loads AMDGPU code objects accepted by HIP (normally .hsaco files). */
 CUDARTAPI cudaError_t oscModuleLoad(oscModule_t *module, const char *path);

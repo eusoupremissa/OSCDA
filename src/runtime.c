@@ -64,6 +64,7 @@ struct osc_hip_api {
     int (*stream_destroy)(void *);
     int (*stream_sync)(void *);
     int (*stream_query)(void *);
+    int (*stream_wait_event)(void *, void *, unsigned int);
     int (*launch_host_func)(void *, cudaHostFn_t, void *);
     int (*event_create)(void **, unsigned int);
     int (*event_destroy)(void *);
@@ -178,6 +179,7 @@ static void osc_backend_init(void)
     OSC_HIP_LOAD(module_launch_kernel, "hipModuleLaunchKernel");
     OSC_HIP_LOAD(get_error_name, "hipGetErrorName");
 #undef OSC_HIP_LOAD
+    osc_hip_symbol((void **)&osc_hip.stream_wait_event, "hipStreamWaitEvent");
 
     int count = 0;
     int status = osc_hip.get_device_count(&count);
@@ -1084,6 +1086,22 @@ static void *osc_native_event(cudaEvent_t handle)
     return native;
 }
 
+cudaError_t cudaStreamWaitEvent(cudaStream_t stream, cudaEvent_t handle, unsigned int flags)
+{
+    if (flags != 0)
+        return osc_result(cudaErrorInvalidValue);
+    if (!osc_uses_amd() || !osc_hip.stream_wait_event)
+        return osc_result(cudaErrorNotSupported);
+
+    void *event = osc_native_event(handle);
+    void *queue;
+    if (!event || !osc_native_stream(stream, &queue))
+        return osc_result(cudaErrorInvalidResourceHandle);
+    int status = osc_hip.stream_wait_event(queue, event, 0);
+    osc_log_hip("hipStreamWaitEvent", status);
+    return osc_result(osc_from_hip(status));
+}
+
 cudaError_t cudaEventDestroy(cudaEvent_t handle)
 {
     if (!handle)
@@ -1251,6 +1269,40 @@ oscBackend_t oscGetBackend(void)
 const char *oscGetBackendName(void)
 {
     return osc_uses_amd() ? "AMD HIP" : "CPU";
+}
+
+cudaError_t oscGetDeviceArch(int device, char *arch, size_t capacity)
+{
+    if (!arch || !capacity)
+        return osc_result(cudaErrorInvalidValue);
+    arch[0] = '\0';
+#if defined(__linux__) && UINTPTR_MAX == UINT64_MAX
+    if (!osc_uses_amd())
+        return osc_result(cudaErrorNotSupported);
+
+    // gcnArchName in the versioned HIP R0600 LP64 device properties ABI.
+    enum { arch_offset = 1160, arch_capacity = 256 };
+    union {
+        max_align_t alignment;
+        unsigned char bytes[4096];
+    } storage = {0};
+    int status = osc_hip.get_device_properties_r0600(storage.bytes, device);
+    osc_log_hip("hipGetDevicePropertiesR0600", status);
+    if (status)
+        return osc_result(osc_from_hip(status));
+    const char *name = (const char *)storage.bytes + arch_offset;
+    const char *end = memchr(name, '\0', arch_capacity);
+    if (!end || strncmp(name, "gfx", 3) || !name[3])
+        return osc_result(cudaErrorNotSupported);
+    size_t size = (size_t)(end - name) + 1;
+    if (size > capacity)
+        return osc_result(cudaErrorInvalidValue);
+    memcpy(arch, name, size);
+    return osc_result(cudaSuccess);
+#else
+    (void)device;
+    return osc_result(cudaErrorNotSupported);
+#endif
 }
 
 cudaError_t oscModuleLoad(oscModule_t *module, const char *path)

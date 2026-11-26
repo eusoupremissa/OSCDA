@@ -105,6 +105,7 @@ CUDARTAPI cudaError_t cudaStreamCreateWithFlags(cudaStream_t *stream, unsigned i
 CUDARTAPI cudaError_t cudaStreamDestroy(cudaStream_t stream);
 CUDARTAPI cudaError_t cudaStreamSynchronize(cudaStream_t stream);
 CUDARTAPI cudaError_t cudaStreamQuery(cudaStream_t stream);
+CUDARTAPI cudaError_t cudaStreamWaitEvent(cudaStream_t stream, cudaEvent_t event, unsigned int flags);
 CUDARTAPI cudaError_t cudaStreamGetFlags(cudaStream_t stream, unsigned int *flags);
 CUDARTAPI cudaError_t cudaLaunchHostFunc(cudaStream_t stream, cudaHostFn_t fn, void *userData);
 CUDARTAPI cudaError_t cudaLaunchKernel(const void *function, dim3 grid, dim3 block,

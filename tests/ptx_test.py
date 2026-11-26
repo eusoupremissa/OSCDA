@@ -111,6 +111,32 @@ class PtxTest(unittest.TestCase):
         embedded_version = fatbin(fatbin_entry(1, MATMUL.encode()))
         self.assertEqual(PTX.read_ptx(embedded_version), MATMUL)
 
+    def test_selects_requested_kernel(self):
+        second = VECTOR_ADD.replace(".entry vector_add", ".entry other_kernel")
+        start = second.index(".visible")
+        combined = VECTOR_ADD + "\n" + second[start:]
+        self.assertIn('__asm__("vector_add")', PTX.translate(combined))
+        self.assertIn('__asm__("other_kernel")', PTX.translate(combined))
+        images = fatbin(fatbin_entry(1, VECTOR_ADD.encode()), fatbin_entry(1, second.encode()))
+        for data in (combined.encode(), images, host_elf(images)):
+            with self.subTest(size=len(data)):
+                translated = PTX.translate_selected(data, "other_kernel")
+                self.assertIn('__asm__("other_kernel")', translated)
+                self.assertNotIn('__asm__("vector_add")', translated)
+
+        unsupported = combined.replace("add.rn.f32", "add.ftz.f32", 1)
+        PTX.translate_selected(unsupported.encode(), "other_kernel")
+        with self.assertRaisesRegex(ValueError, "unsupported instruction"):
+            PTX.translate_selected(unsupported.encode(), "vector_add")
+        with self.assertRaisesRegex(ValueError, "not found"):
+            PTX.translate_selected(images, "missing_kernel")
+        with self.assertRaisesRegex(ValueError, "duplicate PTX entry"):
+            PTX.translate(combined.replace("other_kernel", "vector_add"))
+        entry = fatbin_entry(1, VECTOR_ADD.encode())
+        repeated = fatbin(entry, entry)
+        with self.assertRaisesRegex(ValueError, "ambiguous"):
+            PTX.translate_selected(repeated, "vector_add")
+
     def test_rejects_bad_binary_inputs(self):
         ptx = fatbin_entry(1, VECTOR_ADD.encode())
         for data, error in (

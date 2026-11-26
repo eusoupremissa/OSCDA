@@ -80,9 +80,8 @@ def decompress_ptx(payload, size, compression):
     return output.raw
 
 
-def fatbin_ptx(data):
+def fatbin_images(data):
     position = 0
-    image = None
     while position < len(data):
         header = checked_slice(data, position, 16, "fatbin header")
         magic, version, header_size, body_size = struct.unpack("<IHHQ", header)
@@ -106,8 +105,6 @@ def fatbin_ptx(data):
                 minor, major = struct.unpack_from("<HH", data, position + 24)
                 flags = struct.unpack_from("<Q", data, position + 40)[0]
                 compression = flags & FATBIN_COMPRESSION_MASK
-                if image is not None:
-                    raise ValueError("fatbin contains multiple PTX images")
                 if compressed_size or compression:
                     if (entry_size < 64 or not 0 < compressed_size <= payload_size or
                             compressed_size > MAX_PTX_SIZE):
@@ -122,19 +119,27 @@ def fatbin_ptx(data):
                     raise ValueError("invalid text in fatbin PTX image")
                 # nvFatbin can move the version directive from the payload to metadata.
                 prefix = re.sub(r"/\*.*?\*/|//[^\n]*", " ", ptx, flags=re.S).lstrip()
-                image = f".version {major}.{minor}\n{ptx}" if prefix.startswith(".target") else ptx
+                yield f".version {major}.{minor}\n{ptx}" if prefix.startswith(".target") else ptx
             position = payload + payload_size
-    if image is None:
-        raise ValueError("fatbin contains no PTX image; a cubin alone cannot be translated")
-    return image
+
+
+def ptx_images(data):
+    if data.startswith(b"\x7fELF"):
+        yield from fatbin_images(elf_fatbin(data))
+    elif data.startswith(struct.pack("<I", FATBIN_MAGIC)):
+        yield from fatbin_images(data)
+    else:
+        yield data.decode("utf-8")
 
 
 def read_ptx(data):
-    if data.startswith(b"\x7fELF"):
-        return fatbin_ptx(elf_fatbin(data))
-    if data.startswith(struct.pack("<I", FATBIN_MAGIC)):
-        return fatbin_ptx(data)
-    return data.decode("utf-8")
+    images = ptx_images(data)
+    image = next(images, None)
+    if image is None:
+        raise ValueError("fatbin contains no PTX image; a cubin alone cannot be translated")
+    if next(images, None) is not None:
+        raise ValueError("fatbin contains multiple PTX images; select an entry with --kernel")
+    return image
 
 
 NAME = r"[A-Za-z_][A-Za-z0-9_]*"
@@ -155,6 +160,7 @@ BINARY = {
     "add.rn.f32": ("f32", "f32", "+"),
     "mul.rn.f32": ("f32", "f32", "*"),
     "setp.ge.u32": ("pred", "u32", ">="),
+    "setp.lt.f32": ("pred", "f32", "<"),
 }
 
 
@@ -185,16 +191,63 @@ def validate_flow(flow, labels):
             raise ValueError(f"{statement!r}: possibly uninitialized register {min(missing)}")
 
 
-def translate(source):
-    source = re.sub(r"/\*.*?\*/|//[^\n]*", " ", source, flags=re.S)
-    module = re.fullmatch(
-        rf"\s*\.version\s+(?:[1-7]\.\d+|8\.\d+)\s+\.target\s+sm_\d+"
-        rf"\s+\.address_size\s+64\s+(?:\.visible\s+)?\.entry\s+({NAME})"
-        r"\s*\(([^()]*)\)\s*\{([^{}]*)\}\s*", source)
-    if not module:
-        raise ValueError("expected one 64-bit PTX .entry with a standard module header")
-    name, signature, body = module.groups()
+ENTRY = re.compile(rf"\s*(?:\.visible\s+)?\.entry\s+({NAME})"
+                   r"\s*\(([^()]*)\)\s*\{([^{}]*)\}")
 
+
+def parse_entries(source):
+    source = re.sub(r"/\*.*?\*/|//[^\n]*", " ", source, flags=re.S).rstrip()
+    header = re.match(r"\s*\.version\s+[1-8]\.\d+\s+\.target\s+sm_\d+"
+                      r"\s+\.address_size\s+64\b", source)
+    if not header:
+        raise ValueError("expected a standard 64-bit PTX module header")
+    position = header.end()
+    entries = {}
+    while position < len(source):
+        entry = ENTRY.match(source, position)
+        if not entry:
+            raise ValueError("expected a PTX .entry; unsupported module declaration or entry syntax")
+        name, signature, body = entry.groups()
+        if name in entries:
+            raise ValueError(f"duplicate PTX entry {name}")
+        entries[name] = (signature, body)
+        position = entry.end()
+    if not entries:
+        raise ValueError("PTX module contains no .entry")
+    return entries
+
+
+def translate_selected(data, name):
+    selected = None
+    has_ptx = False
+    for source in ptx_images(data):
+        has_ptx = True
+        entries = parse_entries(source)
+        if name in entries:
+            if selected is not None:
+                raise ValueError(f"PTX entry {name} is ambiguous across fatbin images")
+            selected = entries[name]
+    if not has_ptx:
+        raise ValueError("fatbin contains no PTX image; a cubin alone cannot be translated")
+    if selected is None:
+        raise ValueError(f"PTX entry {name} not found")
+    return translate_entries({name: selected})
+
+
+def translate(source):
+    return translate_entries(parse_entries(source))
+
+
+def translate_entries(entries):
+    return "\n".join([
+        "typedef __attribute__((address_space(1))) float global_float;",
+        "typedef __attribute__((address_space(3))) float shared_float;",
+        *(translate_entry(name, signature, body, index)
+          for index, (name, (signature, body)) in enumerate(entries.items())),
+    ])
+
+
+def translate_entry(name, signature, body, index):
     params = {}
     for parameter in signature.split(",") if signature.strip() else ():
         match = re.fullmatch(rf"\s*\.param\s+\.(u32|u64|f32|b32|b64)\s+({NAME})\s*",
@@ -325,10 +378,8 @@ def translate(source):
     declarations = [f"{TYPES[kind]} r_{register[1:]};" for register, kind in registers.items()]
     # Treat the PTX name as data, even if it coincides with a C++ keyword.
     return "\n".join([
-        "typedef __attribute__((address_space(1))) float global_float;",
-        "typedef __attribute__((address_space(3))) float shared_float;",
-        f'extern "C" __attribute__((global)) void osc_entry({signature}) __asm__("{name}");',
-        f'extern "C" __attribute__((global)) void osc_entry({signature}) {{',
+        f'extern "C" __attribute__((global)) void osc_entry_{index}({signature}) __asm__("{name}");',
+        f'extern "C" __attribute__((global)) void osc_entry_{index}({signature}) {{',
         "    const auto *dispatch = (const __attribute__((address_space(4))) unsigned short *)"
         "__builtin_amdgcn_dispatch_ptr();",
         *("    " + line for line in [*shared.values(), *declarations, *code]),
@@ -339,17 +390,19 @@ def translate(source):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("source", type=Path, help="PTX, CUDA fatbin, or CUDA host ELF")
+    parser.add_argument("--kernel", help="translate only this PTX entry")
     parser.add_argument("--arch", required=True, help="AMD target, e.g. gfx1032")
     parser.add_argument("--clang", default=os.environ.get("OSC_CLANG") or "clang++",
                         help="path to ROCm LLVM clang++")
     parser.add_argument("-o", required=True, type=Path)
     args = parser.parse_args()
-    if not re.fullmatch(r"gfx[0-9a-f]+", args.arch):
+    if not re.fullmatch(r"gfx[0-9a-f]+(?::sramecc[+-])?(?::xnack[+-])?", args.arch):
         parser.error("--arch must be an AMD gfx target")
     if args.source.resolve() == args.o.resolve():
         parser.error("input and output must be different files")
     try:
-        hip = translate(read_ptx(args.source.read_bytes()))
+        data = args.source.read_bytes()
+        hip = translate_selected(data, args.kernel) if args.kernel else translate(read_ptx(data))
         with tempfile.TemporaryDirectory(dir=args.o.parent) as directory:
             output = Path(directory) / "kernel.hsaco"
             subprocess.run([

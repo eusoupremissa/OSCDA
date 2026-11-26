@@ -40,7 +40,6 @@ struct loaded_module {
 struct registered_fatbin {
     const unsigned char *image;
     size_t size;
-    struct loaded_module *modules;
     struct registered_fatbin *next;
 };
 
@@ -48,6 +47,7 @@ struct registered_kernel {
     const void *host_stub;
     const char *name;
     struct registered_fatbin *owner;
+    struct loaded_module *modules;
     struct registered_kernel *next;
 };
 
@@ -64,15 +64,15 @@ static struct registered_kernel *kernels;
 static _Thread_local struct launch_config *launch_config;
 static int module_cleanup_installed;
 
-static void unload_modules(struct registered_fatbin *fatbin)
+static void unload_modules(struct registered_kernel *kernel)
 {
-    if (!fatbin->modules)
+    if (!kernel->modules)
         return;
     int current;
     int restore = cudaGetDevice(&current) == cudaSuccess;
-    while (fatbin->modules) {
-        struct loaded_module *loaded = fatbin->modules;
-        fatbin->modules = loaded->next;
+    while (kernel->modules) {
+        struct loaded_module *loaded = kernel->modules;
+        kernel->modules = loaded->next;
         if (cudaSetDevice(loaded->device) == cudaSuccess)
             oscModuleUnload(loaded->module);
         free(loaded);
@@ -84,8 +84,8 @@ static void unload_modules(struct registered_fatbin *fatbin)
 static void unload_modules_at_exit(void)
 {
     pthread_mutex_lock(&registry_lock);
-    for (struct registered_fatbin *fatbin = fatbins; fatbin; fatbin = fatbin->next)
-        unload_modules(fatbin);
+    for (struct registered_kernel *kernel = kernels; kernel; kernel = kernel->next)
+        unload_modules(kernel);
     pthread_mutex_unlock(&registry_lock);
 }
 
@@ -176,7 +176,7 @@ CUDARTAPI void __cudaRegisterFunction(void **handle, const char *host_stub, char
             continue;
         struct registered_kernel *kernel = malloc(sizeof(*kernel));
         if (kernel) {
-            *kernel = (struct registered_kernel){host_stub, name, fatbin, kernels};
+            *kernel = (struct registered_kernel){host_stub, name, fatbin, NULL, kernels};
             kernels = kernel;
         }
         break;
@@ -198,18 +198,19 @@ CUDARTAPI void __cudaUnregisterFatBinary(void **handle)
             if ((*kernel)->owner == fatbin) {
                 struct registered_kernel *removed = *kernel;
                 *kernel = removed->next;
+                unload_modules(removed);
                 free(removed);
             } else {
                 kernel = &(*kernel)->next;
             }
         }
-        unload_modules(fatbin);
         free(fatbin);
     }
     pthread_mutex_unlock(&registry_lock);
 }
 
-static int run_translator(const char *input, const char *output, const char *arch)
+static int run_translator(const char *input, const char *output, const char *arch,
+                          const char *kernel)
 {
     const char *python = getenv("OSC_PYTHON");
     const char *program =
@@ -224,16 +225,20 @@ static int run_translator(const char *input, const char *output, const char *arc
     snprintf(code, sizeof(code), "\"%s\"", program);
     snprintf(in_arg, sizeof(in_arg), "\"%s\"", input);
     snprintf(out_arg, sizeof(out_arg), "\"%s\"", output);
-    const char *args[] = {"python", "-c", code, in_arg, "--arch", arch, "-o", out_arg, NULL};
+    const char *args[] = {"python", "-c", code, in_arg, "--arch", arch, "--kernel", kernel, "-o", out_arg, NULL};
     return _spawnvp(_P_WAIT, python, args) == 0;
 #else
     if (!python || !*python)
         python = "python3";
     char *args[] = {(char *)python, "-c", (char *)program, (char *)input, "--arch",
-                    (char *)arch, "-o", (char *)output, NULL};
+                    (char *)arch, "--kernel", (char *)kernel, "-o", (char *)output, NULL};
     pid_t child;
-    if (posix_spawnp(&child, python, NULL, NULL, args, environ))
+    int error = posix_spawnp(&child, python, NULL, NULL, args, environ);
+    if (error) {
+        fprintf(stderr, "OSC: cannot start PTX translator with %s: %s\n", python,
+                strerror(error));
         return 0;
+    }
     int status;
     pid_t waited;
     do {
@@ -243,13 +248,20 @@ static int run_translator(const char *input, const char *output, const char *arc
 #endif
 }
 
-static cudaError_t translate_module(const struct registered_fatbin *fatbin, oscModule_t *module)
+static cudaError_t translate_module(const struct registered_kernel *kernel, int device,
+                                    oscModule_t *module)
 {
+    const struct registered_fatbin *fatbin = kernel->owner;
     const char *arch = getenv("OSC_GPU_ARCH");
-    if (!arch || strncmp(arch, "gfx", 3) || !arch[3] ||
-        arch[strspn(arch + 3, "0123456789abcdef") + 3]) {
-        fputs("OSC: set OSC_GPU_ARCH to the AMD GPU target, for example gfx1032\n", stderr);
-        return cudaErrorNotSupported;
+    char detected[256];
+    if (!arch || !*arch) {
+        cudaError_t result = oscGetDeviceArch(device, detected, sizeof(detected));
+        if (result != cudaSuccess) {
+            fprintf(stderr, "OSC: cannot detect AMD target for device %d (%s); set OSC_GPU_ARCH\n",
+                    device, cudaGetErrorName(result));
+            return result;
+        }
+        arch = detected;
     }
 #ifdef _WIN32
     char directory[MAX_PATH], input[MAX_PATH], output[MAX_PATH];
@@ -273,8 +285,16 @@ static cudaError_t translate_module(const struct registered_fatbin *fatbin, oscM
     if (file && fclose(file))
         saved = 0;
     cudaError_t result = cudaErrorInitializationError;
-    if (saved && run_translator(input, output, arch))
+    if (!saved) {
+        fprintf(stderr, "OSC: failed to stage the fatbin for %s\n", kernel->name);
+    } else if (!run_translator(input, output, arch, kernel->name)) {
+        fprintf(stderr, "OSC: PTX translation failed for %s on %s\n", kernel->name, arch);
+    } else {
         result = oscModuleLoad(module, output);
+        if (result != cudaSuccess)
+            fprintf(stderr, "OSC: HIP could not load %s for %s: %s\n", kernel->name,
+                    arch, cudaGetErrorName(result));
+    }
     remove(input);
     remove(output);
 #ifndef _WIN32
@@ -302,17 +322,17 @@ cudaError_t cudaLaunchKernel(const void *function, dim3 grid, dim3 block, void *
         kernel = kernel->next;
     result = cudaErrorInvalidResourceHandle;
     if (kernel) {
-        struct loaded_module *loaded = kernel->owner->modules;
+        struct loaded_module *loaded = kernel->modules;
         while (loaded && loaded->device != device)
             loaded = loaded->next;
         result = cudaSuccess;
         if (!loaded) {
             loaded = malloc(sizeof(*loaded));
-            result = loaded ? translate_module(kernel->owner, &loaded->module) : cudaErrorMemoryAllocation;
+            result = loaded ? translate_module(kernel, device, &loaded->module) : cudaErrorMemoryAllocation;
             if (result == cudaSuccess) {
                 loaded->device = device;
-                loaded->next = kernel->owner->modules;
-                kernel->owner->modules = loaded;
+                loaded->next = kernel->modules;
+                kernel->modules = loaded;
             } else {
                 free(loaded);
             }
@@ -323,12 +343,12 @@ cudaError_t cudaLaunchKernel(const void *function, dim3 grid, dim3 block, void *
             if (result == cudaSuccess)
                 result = osc_launch_kernel(native, grid, block, (unsigned int)shared, arguments, stream);
         }
-        if (kernel->owner->modules && !module_cleanup_installed) {
+        if (kernel->modules && !module_cleanup_installed) {
             // Constructors register CUDA exit hooks before HIP initializes.
             if (atexit(unload_modules_at_exit) == 0) {
                 module_cleanup_installed = 1;
             } else {
-                unload_modules(kernel->owner);
+                unload_modules(kernel);
                 result = cudaErrorInitializationError;
             }
         }
