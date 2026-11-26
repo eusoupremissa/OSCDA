@@ -9,7 +9,7 @@
 
 OSCDA (Open Source Compute Device Architecture), formerly UniWarp, runs a
 subset of CUDA kernels on AMD GPUs through HIP on Linux. The current project
-version is **0.2.3**. This is an early compatibility runtime and PTX translator.
+version is **0.2.4**. This is an early compatibility runtime and PTX translator.
 
 ## Platform policy
 
@@ -24,6 +24,12 @@ Contributors are welcome to audit the code, run individual tests on their own
 Windows systems, and submit pull requests with reproducible results.
 
 ## Changes
+
+**0.2.4** adds a Rust bridge for running translated PTX kernels on tensors and
+streams owned by PyTorch ROCm. LLVM generates AMDGPU code objects as before.
+The [Applio validation](docs/applio-validation.md) exercises the ReLU operator
+inside an actual RVC inference run on the RX 6600 and compares the resulting WAV
+with native ROCm inference.
 
 **0.2.3** detects the selected HIP device's AMD target on 64-bit Linux and
 loads only the PTX entry requested by each launch. Fatbins can contain several
@@ -196,7 +202,8 @@ functions or module-scope data declarations are outside the translator subset.
 CUDA C++ device compilation,
 SASS translation, general CUDA binary compatibility, CUDA graphs, and NVIDIA
 libraries such as cuBLAS and cuDNN are outside the current scope. PyTorch CUDA
-wheels and applications such as RVC have not been validated with OSCDA.
+wheels are outside the validated scope. The Applio validation uses native
+PyTorch ROCm for the rest of the model and OSCDA for the documented operator.
 
 ## Contributing
 

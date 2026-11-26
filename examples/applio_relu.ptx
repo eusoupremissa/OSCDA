@@ -1,0 +1,34 @@
+.version 7.0
+.target sm_70
+.address_size 64
+
+.visible .entry applio_relu(.param .u64 input, .param .u64 output, .param .u32 count)
+{
+    .reg .b32 %r<5>;
+    .reg .b64 %rd<3>;
+    .reg .f32 %f;
+    .reg .pred %p;
+
+    ld.param.u32 %r0, [count];
+    mov.u32 %r1, %ctaid.x;
+    mov.u32 %r2, %ntid.x;
+    mov.u32 %r3, %tid.x;
+    mad.lo.u32 %r4, %r1, %r2, %r3;
+    setp.ge.u32 %p, %r4, %r0;
+    @%p ret;
+
+    ld.param.u64 %rd0, [input];
+    ld.param.u64 %rd1, [output];
+    cvta.to.global.u64 %rd0, %rd0;
+    cvta.to.global.u64 %rd1, %rd1;
+    mul.wide.u32 %rd2, %r4, 4;
+    add.u64 %rd0, %rd0, %rd2;
+    add.u64 %rd1, %rd1, %rd2;
+    ld.global.f32 %f, [%rd0];
+    setp.lt.f32 %p, %f, 0f00000000;
+    @!%p bra store;
+    mov.f32 %f, 0f00000000;
+store:
+    st.global.f32 [%rd1], %f;
+    ret;
+}

@@ -5,7 +5,7 @@
 
 #define OSCDA_VERSION_MAJOR 0
 #define OSCDA_VERSION_MINOR 2
-#define OSCDA_VERSION_PATCH 3
+#define OSCDA_VERSION_PATCH 4
 
 #ifdef __cplusplus
 extern "C" {
@@ -30,6 +30,13 @@ CUDARTAPI cudaError_t oscModuleLoad(oscModule_t *module, const char *path);
 CUDARTAPI cudaError_t oscModuleUnload(oscModule_t module);
 CUDARTAPI cudaError_t oscModuleGetFunction(oscFunction_t *function, oscModule_t module,
                                             const char *name);
+/* Enqueues on a borrowed native hipStream_t from the active HIP runtime.
+ * Select the module and stream device before calling. The caller owns the stream,
+ * synchronizes outstanding work and keeps device resources alive.
+ * Pass NULL for HIP's default stream. Device pointers may come from the same HIP runtime. */
+CUDARTAPI cudaError_t oscLaunchKernelOnHipStream(oscFunction_t function, dim3 grid, dim3 block,
+                                                unsigned int shared_memory_bytes,
+                                                void **arguments, void *hip_stream);
 CUDARTAPI cudaError_t oscLaunchKernel(oscFunction_t function,
                                       unsigned int grid_x, unsigned int grid_y, unsigned int grid_z,
                                       unsigned int block_x, unsigned int block_y, unsigned int block_z,

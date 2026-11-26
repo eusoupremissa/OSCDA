@@ -1346,21 +1346,27 @@ cudaError_t oscModuleGetFunction(oscFunction_t *function, oscModule_t module, co
     return osc_result(error);
 }
 
-cudaError_t osc_launch_kernel(oscFunction_t function, dim3 grid, dim3 block,
-                              unsigned int shared, void **arguments, cudaStream_t stream)
+cudaError_t oscLaunchKernelOnHipStream(oscFunction_t function, dim3 grid, dim3 block,
+                                      unsigned int shared, void **arguments, void *hip_stream)
 {
     if (!function || !grid.x || !grid.y || !grid.z || !block.x || !block.y || !block.z)
         return osc_result(cudaErrorInvalidValue);
     if (!osc_uses_amd())
         return osc_result(cudaErrorNotSupported);
+    int result = osc_hip.module_launch_kernel(
+        (void *)function, grid.x, grid.y, grid.z, block.x, block.y, block.z,
+        shared, hip_stream, arguments, NULL);
+    osc_log_hip("hipModuleLaunchKernel", result);
+    return osc_result(osc_from_hip(result));
+}
+
+cudaError_t osc_launch_kernel(oscFunction_t function, dim3 grid, dim3 block,
+                              unsigned int shared, void **arguments, cudaStream_t stream)
+{
     void *native;
     if (!osc_native_stream(stream, &native))
         return osc_result(cudaErrorInvalidResourceHandle);
-    int result = osc_hip.module_launch_kernel(
-        (void *)function, grid.x, grid.y, grid.z, block.x, block.y, block.z,
-        shared, native, arguments, NULL);
-    osc_log_hip("hipModuleLaunchKernel", result);
-    return osc_result(osc_from_hip(result));
+    return oscLaunchKernelOnHipStream(function, grid, block, shared, arguments, native);
 }
 
 cudaError_t oscLaunchKernel(oscFunction_t function,
