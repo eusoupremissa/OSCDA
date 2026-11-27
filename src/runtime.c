@@ -3,6 +3,8 @@
 #include <cuda_runtime_api.h>
 #include <osc/osc.h>
 
+#include "intel_backend.h"
+
 #include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -12,220 +14,18 @@
 #ifdef _WIN32
 #include <windows.h>
 #else
-#include <dlfcn.h>
 #include <unistd.h>
 #endif
 
 enum osc_backend_kind {
     OSC_BACKEND_CPU,
-    OSC_BACKEND_AMD_HIP
+    OSC_BACKEND_INTEL_LEVEL_ZERO
 };
 
-/* Stable prefix of HIP's versioned R0600 device-properties ABI. */
-struct osc_hip_device_properties_r0600 {
-    char name[256];
-    unsigned char uuid[16];
-    char luid[8];
-    unsigned int luid_device_node_mask;
-    size_t total_global_memory;
-    size_t shared_memory_per_block;
-    int registers_per_block;
-    int warp_size;
-    size_t memory_pitch;
-    int max_threads_per_block;
-    int max_threads_dimension[3];
-    int max_grid_size[3];
-    int clock_rate;
-    size_t total_constant_memory;
-    int major;
-    int minor;
-    size_t texture_alignment;
-    size_t texture_pitch_alignment;
-    int device_overlap;
-    int multiprocessor_count;
-};
-
-struct osc_hip_api {
-    void *library;
-    int (*get_device_count)(int *);
-    int (*get_device)(int *);
-    int (*set_device)(int);
-    int (*get_device_properties_r0600)(void *, int);
-    int (*device_synchronize)(void);
-    int (*malloc)(void **, size_t);
-    int (*free)(void *);
-    int (*memcpy)(void *, const void *, size_t, int);
-    int (*memset)(void *, int, size_t);
-    int (*host_malloc)(void **, size_t, unsigned int);
-    int (*host_free)(void *);
-    int (*memcpy_async)(void *, const void *, size_t, int, void *);
-    int (*memset_async)(void *, int, size_t, void *);
-    int (*stream_create)(void **, unsigned int);
-    int (*stream_destroy)(void *);
-    int (*stream_sync)(void *);
-    int (*stream_query)(void *);
-    int (*stream_wait_event)(void *, void *, unsigned int);
-    int (*launch_host_func)(void *, cudaHostFn_t, void *);
-    int (*event_create)(void **, unsigned int);
-    int (*event_destroy)(void *);
-    int (*event_record)(void *, void *);
-    int (*event_sync)(void *);
-    int (*event_query)(void *);
-    int (*event_elapsed_time)(float *, void *, void *);
-    int (*module_load)(void **, const char *);
-    int (*module_unload)(void *);
-    int (*module_get_function)(void **, void *, const char *);
-    int (*module_launch_kernel)(void *, unsigned int, unsigned int, unsigned int,
-                                unsigned int, unsigned int, unsigned int,
-                                unsigned int, void *, void **, void **);
-    const char *(*get_error_name)(int);
-};
-
-static pthread_once_t osc_backend_once = PTHREAD_ONCE_INIT;
-static enum osc_backend_kind osc_backend = OSC_BACKEND_CPU;
-static struct osc_hip_api osc_hip;
-static int osc_hip_diagnostics;
-
-static void osc_log_hip(const char *operation, int status)
-{
-    if (osc_hip_diagnostics) {
-        const char *name = osc_hip.get_error_name ? osc_hip.get_error_name(status) : NULL;
-        fprintf(stderr, "OSC HIP: %s -> %d (%s)\n", operation, status, name ? name : "unknown");
-    }
-}
-
-static void *osc_open_hip(const char *library)
-{
-#ifdef _WIN32
-    void *handle = LoadLibraryA(library);
-    DWORD error = handle ? 0 : GetLastError();
-    if (osc_hip_diagnostics)
-        fprintf(stderr, "OSC HIP: LoadLibrary(%s) -> Windows error %lu\n", library,
-                (unsigned long)error);
-#else
-    void *handle = dlopen(library, RTLD_NOW | RTLD_LOCAL);
-    if (osc_hip_diagnostics)
-        fprintf(stderr, "OSC HIP: dlopen(%s) -> %s\n", library, handle ? "loaded" : dlerror());
-#endif
-    return handle;
-}
-
-static int osc_hip_symbol(void **target, const char *name)
-{
-#ifdef _WIN32
-    *target = (void *)(uintptr_t)GetProcAddress(osc_hip.library, name);
-#else
-    *target = dlsym(osc_hip.library, name);
-#endif
-    return *target != NULL;
-}
-
-static void osc_backend_init(void)
+static int osc_uses_intel(void)
 {
     const char *requested = getenv("OSC_BACKEND");
-    if (requested && strcmp(requested, "cpu") == 0)
-        return;
-
-    const char *diagnostics = getenv("OSC_HIP_DIAGNOSTICS");
-    osc_hip_diagnostics = diagnostics && strcmp(diagnostics, "1") == 0;
-    const char *library = getenv("OSC_HIP_LIBRARY");
-    if (library && *library) {
-        osc_hip.library = osc_open_hip(library);
-    } else {
-#ifdef _WIN32
-        const char *candidates[] = {"amdhip64_6.dll", "amdhip64_7.dll", "amdhip64.dll"};
-#else
-        const char *candidates[] = {"libamdhip64.so.6", "libamdhip64.so.7", "libamdhip64.so"};
-#endif
-        for (size_t i = 0; i < sizeof(candidates) / sizeof(*candidates) && !osc_hip.library; ++i)
-            osc_hip.library = osc_open_hip(candidates[i]);
-    }
-    if (!osc_hip.library)
-        return;
-
-#define OSC_HIP_LOAD(field, symbol) \
-    if (!osc_hip_symbol((void **)&osc_hip.field, symbol)) { \
-        if (osc_hip_diagnostics) \
-            fprintf(stderr, "OSC HIP: missing symbol %s\n", symbol); \
-        goto unavailable; \
-    }
-    OSC_HIP_LOAD(get_device_count, "hipGetDeviceCount");
-    OSC_HIP_LOAD(get_device, "hipGetDevice");
-    OSC_HIP_LOAD(set_device, "hipSetDevice");
-    OSC_HIP_LOAD(get_device_properties_r0600, "hipGetDevicePropertiesR0600");
-    OSC_HIP_LOAD(device_synchronize, "hipDeviceSynchronize");
-    OSC_HIP_LOAD(malloc, "hipMalloc");
-    OSC_HIP_LOAD(free, "hipFree");
-    OSC_HIP_LOAD(memcpy, "hipMemcpy");
-    OSC_HIP_LOAD(memset, "hipMemset");
-    OSC_HIP_LOAD(host_malloc, "hipHostMalloc");
-    OSC_HIP_LOAD(host_free, "hipHostFree");
-    OSC_HIP_LOAD(memcpy_async, "hipMemcpyAsync");
-    OSC_HIP_LOAD(memset_async, "hipMemsetAsync");
-    OSC_HIP_LOAD(stream_create, "hipStreamCreateWithFlags");
-    OSC_HIP_LOAD(stream_destroy, "hipStreamDestroy");
-    OSC_HIP_LOAD(stream_sync, "hipStreamSynchronize");
-    OSC_HIP_LOAD(stream_query, "hipStreamQuery");
-    OSC_HIP_LOAD(launch_host_func, "hipLaunchHostFunc");
-    OSC_HIP_LOAD(event_create, "hipEventCreateWithFlags");
-    OSC_HIP_LOAD(event_destroy, "hipEventDestroy");
-    OSC_HIP_LOAD(event_record, "hipEventRecord");
-    OSC_HIP_LOAD(event_sync, "hipEventSynchronize");
-    OSC_HIP_LOAD(event_query, "hipEventQuery");
-    OSC_HIP_LOAD(event_elapsed_time, "hipEventElapsedTime");
-    OSC_HIP_LOAD(module_load, "hipModuleLoad");
-    OSC_HIP_LOAD(module_unload, "hipModuleUnload");
-    OSC_HIP_LOAD(module_get_function, "hipModuleGetFunction");
-    OSC_HIP_LOAD(module_launch_kernel, "hipModuleLaunchKernel");
-    OSC_HIP_LOAD(get_error_name, "hipGetErrorName");
-#undef OSC_HIP_LOAD
-    osc_hip_symbol((void **)&osc_hip.stream_wait_event, "hipStreamWaitEvent");
-
-    int count = 0;
-    int status = osc_hip.get_device_count(&count);
-    osc_log_hip("hipGetDeviceCount", status);
-    if (osc_hip_diagnostics)
-        fprintf(stderr, "OSC HIP: visible devices: %d\n", count);
-    if (status == 0 && count > 0) {
-        osc_backend = OSC_BACKEND_AMD_HIP;
-        return;
-    }
-
-unavailable:
-#ifdef _WIN32
-    FreeLibrary(osc_hip.library);
-#else
-    dlclose(osc_hip.library);
-#endif
-    memset(&osc_hip, 0, sizeof(osc_hip));
-}
-
-static int osc_uses_amd(void)
-{
-    pthread_once(&osc_backend_once, osc_backend_init);
-    return osc_backend == OSC_BACKEND_AMD_HIP;
-}
-
-static cudaError_t osc_from_hip(int error)
-{
-    if (error == 0)
-        return cudaSuccess;
-    const char *name = osc_hip.get_error_name ? osc_hip.get_error_name(error) : NULL;
-    if (!name)
-        return cudaErrorUnknown;
-    if (strstr(name, "OutOfMemory"))
-        return cudaErrorMemoryAllocation;
-    if (strstr(name, "InvalidDevice"))
-        return cudaErrorInvalidDevice;
-    if (strstr(name, "InvalidValue"))
-        return cudaErrorInvalidValue;
-    if (strstr(name, "InvalidHandle") || strstr(name, "InvalidResourceHandle"))
-        return cudaErrorInvalidResourceHandle;
-    if (strstr(name, "NotReady"))
-        return cudaErrorNotReady;
-    if (strstr(name, "NotSupported"))
-        return cudaErrorNotSupported;
-    return cudaErrorUnknown;
+    return (!requested || strcmp(requested, "cpu") != 0) && osc_intel_available();
 }
 
 typedef cudaError_t (*osc_job_fn)(void *);
@@ -237,7 +37,6 @@ struct osc_job {
 };
 
 struct osc_stream {
-    void *native;
     pthread_t worker;
     pthread_mutex_t lock;
     pthread_cond_t wake;
@@ -252,7 +51,6 @@ struct osc_stream {
 };
 
 struct osc_event {
-    void *native;
     pthread_mutex_t lock;
     pthread_cond_t ready;
     struct timespec timestamp;
@@ -371,31 +169,14 @@ static void osc_default_init(void)
 
 static struct osc_stream *osc_stream_find(cudaStream_t handle)
 {
-    if (!handle) {
-        pthread_once(&osc_default_once, osc_default_init);
+    pthread_once(&osc_default_once, osc_default_init);
+    if (!handle)
         return osc_default_status == cudaSuccess ? &osc_default_stream : NULL;
-    }
 
     struct osc_stream *stream = osc_streams;
     while (stream && stream != handle)
         stream = stream->next;
     return stream;
-}
-
-/* HIP owns ordering and completion for AMD work, including host callbacks. */
-static int osc_native_stream(cudaStream_t handle, void **native)
-{
-    if (!handle) {
-        *native = NULL;
-        return 1;
-    }
-    pthread_mutex_lock(&osc_runtime_lock);
-    struct osc_stream *stream = osc_stream_find(handle);
-    int found = stream != NULL;
-    if (found)
-        *native = stream->native;
-    pthread_mutex_unlock(&osc_runtime_lock);
-    return found;
 }
 
 static cudaError_t osc_submit(cudaStream_t handle, osc_job_fn run, void *data)
@@ -526,17 +307,26 @@ static cudaError_t osc_validate_copy(void *dst, const void *src, size_t size, cu
 static cudaError_t osc_copy_run(void *data)
 {
     struct osc_copy *copy = data;
-    memmove(copy->dst, copy->src, copy->size);
+    cudaError_t error = cudaSuccess;
+    if (osc_range_backend(copy->dst, copy->size) == OSC_BACKEND_INTEL_LEVEL_ZERO ||
+        osc_range_backend(copy->src, copy->size) == OSC_BACKEND_INTEL_LEVEL_ZERO)
+        error = osc_intel_memcpy(copy->dst, copy->src, copy->size);
+    else
+        memmove(copy->dst, copy->src, copy->size);
     free(copy);
-    return cudaSuccess;
+    return error;
 }
 
 static cudaError_t osc_fill_run(void *data)
 {
     struct osc_fill *fill = data;
-    memset(fill->dst, fill->value, fill->size);
+    cudaError_t error = cudaSuccess;
+    if (osc_range_backend(fill->dst, fill->size) == OSC_BACKEND_INTEL_LEVEL_ZERO)
+        error = osc_intel_memset(fill->dst, fill->value, fill->size);
+    else
+        memset(fill->dst, fill->value, fill->size);
     free(fill);
-    return cudaSuccess;
+    return error;
 }
 
 static cudaError_t osc_callback_run(void *data)
@@ -620,8 +410,10 @@ cudaError_t cudaGetDeviceCount(int *count)
 {
     if (!count)
         return osc_result(cudaErrorInvalidValue);
-    if (osc_uses_amd())
-        return osc_result(osc_from_hip(osc_hip.get_device_count(count)));
+    if (osc_uses_intel()) {
+        *count = 1;
+        return osc_result(cudaSuccess);
+    }
     *count = 1;
     return osc_result(cudaSuccess);
 }
@@ -630,16 +422,18 @@ cudaError_t cudaGetDevice(int *device)
 {
     if (!device)
         return osc_result(cudaErrorInvalidValue);
-    if (osc_uses_amd())
-        return osc_result(osc_from_hip(osc_hip.get_device(device)));
+    if (osc_uses_intel()) {
+        *device = 0;
+        return osc_result(cudaSuccess);
+    }
     *device = 0;
     return osc_result(cudaSuccess);
 }
 
 cudaError_t cudaSetDevice(int device)
 {
-    if (osc_uses_amd())
-        return osc_result(osc_from_hip(osc_hip.set_device(device)));
+    if (osc_uses_intel())
+        return osc_result(device == 0 ? cudaSuccess : cudaErrorInvalidDevice);
     return osc_result(device == 0 ? cudaSuccess : cudaErrorInvalidDevice);
 }
 
@@ -648,39 +442,8 @@ cudaError_t cudaGetDeviceProperties(cudaDeviceProp *prop, int device)
     if (!prop)
         return osc_result(cudaErrorInvalidValue);
     memset(prop, 0, sizeof(*prop));
-    if (osc_uses_amd()) {
-        int count = 0;
-        if (osc_hip.get_device_count(&count) != 0 || device < 0 || device >= count)
-            return osc_result(cudaErrorInvalidDevice);
-        union {
-            max_align_t alignment;
-            unsigned char bytes[4096];
-        } storage;
-        memset(&storage, 0, sizeof(storage));
-        cudaError_t error = osc_from_hip(
-            osc_hip.get_device_properties_r0600(storage.bytes, device));
-        if (error != cudaSuccess)
-            return osc_result(error);
-        const struct osc_hip_device_properties_r0600 *native =
-            (const struct osc_hip_device_properties_r0600 *)storage.bytes;
-        memcpy(prop->name, native->name, sizeof(prop->name));
-        prop->totalGlobalMem = native->total_global_memory;
-        prop->sharedMemPerBlock = native->shared_memory_per_block;
-        prop->regsPerBlock = native->registers_per_block;
-        prop->warpSize = native->warp_size;
-        prop->memPitch = native->memory_pitch;
-        prop->maxThreadsPerBlock = native->max_threads_per_block;
-        memcpy(prop->maxThreadsDim, native->max_threads_dimension, sizeof(prop->maxThreadsDim));
-        memcpy(prop->maxGridSize, native->max_grid_size, sizeof(prop->maxGridSize));
-        prop->clockRate = native->clock_rate;
-        prop->totalConstMem = native->total_constant_memory;
-        prop->major = native->major;
-        prop->minor = native->minor;
-        prop->multiProcessorCount = native->multiprocessor_count;
-        prop->concurrentKernels = 1;
-        prop->unifiedAddressing = 1;
-        return osc_result(cudaSuccess);
-    }
+    if (osc_uses_intel())
+        return osc_result(device == 0 ? osc_intel_get_properties(prop) : cudaErrorInvalidDevice);
     if (device != 0)
         return osc_result(cudaErrorInvalidDevice);
 
@@ -709,8 +472,6 @@ cudaError_t cudaGetDeviceProperties(cudaDeviceProp *prop, int device)
 
 cudaError_t cudaDeviceSynchronize(void)
 {
-    if (osc_uses_amd())
-        return osc_result(osc_from_hip(osc_hip.device_synchronize()));
     pthread_once(&osc_default_once, osc_default_init);
     if (osc_default_status != cudaSuccess)
         return osc_result((cudaError_t)osc_default_status);
@@ -723,6 +484,8 @@ cudaError_t cudaDeviceSynchronize(void)
             error = current;
     }
     pthread_mutex_unlock(&osc_runtime_lock);
+    if (error == cudaSuccess && osc_uses_intel())
+        error = osc_intel_synchronize();
     return osc_result(error);
 }
 
@@ -732,9 +495,9 @@ cudaError_t cudaMalloc(void **ptr, size_t size)
         return osc_result(cudaErrorInvalidValue);
 
     void *memory = NULL;
-    enum osc_backend_kind backend = osc_uses_amd() ? OSC_BACKEND_AMD_HIP : OSC_BACKEND_CPU;
-    if (backend == OSC_BACKEND_AMD_HIP) {
-        cudaError_t error = osc_from_hip(osc_hip.malloc(&memory, size));
+    enum osc_backend_kind backend = osc_uses_intel() ? OSC_BACKEND_INTEL_LEVEL_ZERO : OSC_BACKEND_CPU;
+    if (backend == OSC_BACKEND_INTEL_LEVEL_ZERO) {
+        cudaError_t error = osc_intel_malloc(&memory, size);
         if (error != cudaSuccess) {
             *ptr = NULL;
             return osc_result(error);
@@ -744,8 +507,8 @@ cudaError_t cudaMalloc(void **ptr, size_t size)
     }
     struct osc_allocation *allocation = malloc(sizeof(*allocation));
     if (!memory || !allocation) {
-        if (memory && backend == OSC_BACKEND_AMD_HIP)
-            osc_hip.free(memory);
+        if (memory && backend == OSC_BACKEND_INTEL_LEVEL_ZERO)
+            osc_intel_free(memory, size);
         else
             free(memory);
         free(allocation);
@@ -785,8 +548,8 @@ cudaError_t cudaFree(void *ptr)
     *cursor = allocation->next;
     pthread_mutex_unlock(&osc_memory_lock);
 
-    if (allocation->backend == OSC_BACKEND_AMD_HIP)
-        error = osc_from_hip(osc_hip.free(allocation->base));
+    if (allocation->backend == OSC_BACKEND_INTEL_LEVEL_ZERO)
+        error = osc_intel_free(allocation->base, allocation->size);
     else
         free(allocation->base);
     free(allocation);
@@ -797,16 +560,12 @@ cudaError_t cudaMallocHost(void **ptr, size_t size)
 {
     if (!ptr || !size)
         return osc_result(cudaErrorInvalidValue);
-    if (osc_uses_amd())
-        return osc_result(osc_from_hip(osc_hip.host_malloc(ptr, size, 0)));
     *ptr = malloc(size);
     return osc_result(*ptr ? cudaSuccess : cudaErrorMemoryAllocation);
 }
 
 cudaError_t cudaFreeHost(void *ptr)
 {
-    if (ptr && osc_uses_amd())
-        return osc_result(osc_from_hip(osc_hip.host_free(ptr)));
     free(ptr);
     return osc_result(cudaSuccess);
 }
@@ -818,9 +577,9 @@ cudaError_t cudaMemcpy(void *dst, const void *src, size_t count, cudaMemcpyKind 
         return osc_result(error);
     error = cudaDeviceSynchronize();
     if (error == cudaSuccess && count) {
-        if (osc_range_backend(dst, count) == OSC_BACKEND_AMD_HIP ||
-            osc_range_backend(src, count) == OSC_BACKEND_AMD_HIP)
-            error = osc_from_hip(osc_hip.memcpy(dst, src, count, 4));
+        if (osc_range_backend(dst, count) == OSC_BACKEND_INTEL_LEVEL_ZERO ||
+            osc_range_backend(src, count) == OSC_BACKEND_INTEL_LEVEL_ZERO)
+            error = osc_intel_memcpy(dst, src, count);
         else
             memmove(dst, src, count);
     }
@@ -835,12 +594,6 @@ cudaError_t cudaMemcpyAsync(void *dst, const void *src, size_t count, cudaMemcpy
     if (!count)
         return osc_result(cudaSuccess);
 
-    if (osc_uses_amd()) {
-        void *native;
-        if (!osc_native_stream(stream, &native))
-            return osc_result(cudaErrorInvalidResourceHandle);
-        return osc_result(osc_from_hip(osc_hip.memcpy_async(dst, src, count, kind, native)));
-    }
     struct osc_copy *copy = malloc(sizeof(*copy));
     if (!copy)
         return osc_result(cudaErrorMemoryAllocation);
@@ -856,8 +609,8 @@ cudaError_t cudaMemset(void *dst, int value, size_t count)
         return osc_result(cudaErrorInvalidValue);
     cudaError_t error = cudaDeviceSynchronize();
     if (error == cudaSuccess && count) {
-        if (osc_range_backend(dst, count) == OSC_BACKEND_AMD_HIP)
-            error = osc_from_hip(osc_hip.memset(dst, value, count));
+        if (osc_range_backend(dst, count) == OSC_BACKEND_INTEL_LEVEL_ZERO)
+            error = osc_intel_memset(dst, value, count);
         else
             memset(dst, value, count);
     }
@@ -871,12 +624,6 @@ cudaError_t cudaMemsetAsync(void *dst, int value, size_t count, cudaStream_t str
     if (!count)
         return osc_result(cudaSuccess);
 
-    if (osc_uses_amd()) {
-        void *native;
-        if (!osc_native_stream(stream, &native))
-            return osc_result(cudaErrorInvalidResourceHandle);
-        return osc_result(osc_from_hip(osc_hip.memset_async(dst, value, count, native)));
-    }
     struct osc_fill *fill = malloc(sizeof(*fill));
     if (!fill)
         return osc_result(cudaErrorMemoryAllocation);
@@ -896,19 +643,13 @@ cudaError_t cudaStreamCreateWithFlags(cudaStream_t *stream, unsigned int flags)
     if (!stream || (flags & ~cudaStreamNonBlocking))
         return osc_result(cudaErrorInvalidValue);
 
-    struct osc_stream *created = calloc(1, sizeof(*created));
+    struct osc_stream *created = malloc(sizeof(*created));
     if (!created)
         return osc_result(cudaErrorMemoryAllocation);
-    cudaError_t error = cudaSuccess;
-    if (osc_uses_amd())
-        error = osc_from_hip(osc_hip.stream_create(&created->native, flags));
-    else if (!osc_stream_init(created, flags))
-        error = cudaErrorInitializationError;
-    if (error != cudaSuccess) {
+    if (!osc_stream_init(created, flags)) {
         free(created);
-        return osc_result(error);
+        return osc_result(cudaErrorInitializationError);
     }
-    created->flags = flags;
 
     pthread_mutex_lock(&osc_runtime_lock);
     created->next = osc_streams;
@@ -932,13 +673,6 @@ cudaError_t cudaStreamDestroy(cudaStream_t handle)
         return osc_result(cudaErrorInvalidResourceHandle);
     }
     struct osc_stream *stream = *cursor;
-    if (stream->native) {
-        *cursor = stream->next;
-        pthread_mutex_unlock(&osc_runtime_lock);
-        cudaError_t error = osc_from_hip(osc_hip.stream_destroy(stream->native));
-        free(stream);
-        return osc_result(error);
-    }
     cudaError_t error = osc_stream_wait(stream);
     *cursor = stream->next;
     pthread_mutex_unlock(&osc_runtime_lock);
@@ -957,12 +691,6 @@ cudaError_t cudaStreamDestroy(cudaStream_t handle)
 
 cudaError_t cudaStreamSynchronize(cudaStream_t handle)
 {
-    if (osc_uses_amd()) {
-        void *native;
-        if (!osc_native_stream(handle, &native))
-            return osc_result(cudaErrorInvalidResourceHandle);
-        return osc_result(osc_from_hip(osc_hip.stream_sync(native)));
-    }
     pthread_mutex_lock(&osc_runtime_lock);
     struct osc_stream *stream = osc_stream_find(handle);
     if (!stream) {
@@ -976,12 +704,6 @@ cudaError_t cudaStreamSynchronize(cudaStream_t handle)
 
 cudaError_t cudaStreamQuery(cudaStream_t handle)
 {
-    if (osc_uses_amd()) {
-        void *native;
-        if (!osc_native_stream(handle, &native))
-            return osc_result(cudaErrorInvalidResourceHandle);
-        return osc_result(osc_from_hip(osc_hip.stream_query(native)));
-    }
     pthread_mutex_lock(&osc_runtime_lock);
     struct osc_stream *stream = osc_stream_find(handle);
     if (!stream) {
@@ -999,10 +721,6 @@ cudaError_t cudaStreamGetFlags(cudaStream_t handle, unsigned int *flags)
 {
     if (!flags)
         return osc_result(cudaErrorInvalidValue);
-    if (!handle && osc_uses_amd()) {
-        *flags = cudaStreamDefault;
-        return osc_result(cudaSuccess);
-    }
     pthread_mutex_lock(&osc_runtime_lock);
     struct osc_stream *stream = osc_stream_find(handle);
     if (stream)
@@ -1015,12 +733,6 @@ cudaError_t cudaLaunchHostFunc(cudaStream_t stream, cudaHostFn_t fn, void *userD
 {
     if (!fn)
         return osc_result(cudaErrorInvalidValue);
-    if (osc_uses_amd()) {
-        void *native;
-        if (!osc_native_stream(stream, &native))
-            return osc_result(cudaErrorInvalidResourceHandle);
-        return osc_result(osc_from_hip(osc_hip.launch_host_func(native, fn, userData)));
-    }
     struct osc_callback *callback = malloc(sizeof(*callback));
     if (!callback)
         return osc_result(cudaErrorMemoryAllocation);
@@ -1043,22 +755,14 @@ cudaError_t cudaEventCreateWithFlags(cudaEvent_t *event, unsigned int flags)
     if (!created)
         return osc_result(cudaErrorMemoryAllocation);
     created->flags = flags;
-    if (osc_uses_amd()) {
-        cudaError_t error = osc_from_hip(osc_hip.event_create(&created->native, flags));
-        if (error != cudaSuccess) {
-            free(created);
-            return osc_result(error);
-        }
-    } else {
-        if (pthread_mutex_init(&created->lock, NULL) != 0) {
-            free(created);
-            return osc_result(cudaErrorInitializationError);
-        }
-        if (pthread_cond_init(&created->ready, NULL) != 0) {
-            pthread_mutex_destroy(&created->lock);
-            free(created);
-            return osc_result(cudaErrorInitializationError);
-        }
+    if (pthread_mutex_init(&created->lock, NULL) != 0) {
+        free(created);
+        return osc_result(cudaErrorInitializationError);
+    }
+    if (pthread_cond_init(&created->ready, NULL) != 0) {
+        pthread_mutex_destroy(&created->lock);
+        free(created);
+        return osc_result(cudaErrorInitializationError);
     }
 
     pthread_mutex_lock(&osc_runtime_lock);
@@ -1077,40 +781,13 @@ static struct osc_event *osc_event_find(cudaEvent_t handle)
     return event;
 }
 
-static void *osc_native_event(cudaEvent_t handle)
-{
-    pthread_mutex_lock(&osc_runtime_lock);
-    struct osc_event *event = osc_event_find(handle);
-    void *native = event ? event->native : NULL;
-    pthread_mutex_unlock(&osc_runtime_lock);
-    return native;
-}
-
-cudaError_t cudaStreamWaitEvent(cudaStream_t stream, cudaEvent_t handle, unsigned int flags)
-{
-    if (flags != 0)
-        return osc_result(cudaErrorInvalidValue);
-    if (!osc_uses_amd() || !osc_hip.stream_wait_event)
-        return osc_result(cudaErrorNotSupported);
-
-    void *event = osc_native_event(handle);
-    void *queue;
-    if (!event || !osc_native_stream(stream, &queue))
-        return osc_result(cudaErrorInvalidResourceHandle);
-    int status = osc_hip.stream_wait_event(queue, event, 0);
-    osc_log_hip("hipStreamWaitEvent", status);
-    return osc_result(osc_from_hip(status));
-}
-
 cudaError_t cudaEventDestroy(cudaEvent_t handle)
 {
     if (!handle)
         return osc_result(cudaErrorInvalidResourceHandle);
-    if (!osc_uses_amd()) {
-        cudaError_t error = cudaEventSynchronize(handle);
-        if (error != cudaSuccess)
-            return error;
-    }
+    cudaError_t error = cudaEventSynchronize(handle);
+    if (error != cudaSuccess)
+        return error;
 
     pthread_mutex_lock(&osc_runtime_lock);
     struct osc_event **cursor = &osc_events;
@@ -1124,11 +801,6 @@ cudaError_t cudaEventDestroy(cudaEvent_t handle)
     *cursor = event->next;
     pthread_mutex_unlock(&osc_runtime_lock);
 
-    if (event->native) {
-        cudaError_t error = osc_from_hip(osc_hip.event_destroy(event->native));
-        free(event);
-        return osc_result(error);
-    }
     pthread_cond_destroy(&event->ready);
     pthread_mutex_destroy(&event->lock);
     free(event);
@@ -1137,13 +809,6 @@ cudaError_t cudaEventDestroy(cudaEvent_t handle)
 
 cudaError_t cudaEventRecord(cudaEvent_t handle, cudaStream_t stream)
 {
-    if (osc_uses_amd()) {
-        void *event = osc_native_event(handle);
-        void *queue;
-        if (!event || !osc_native_stream(stream, &queue))
-            return osc_result(cudaErrorInvalidResourceHandle);
-        return osc_result(osc_from_hip(osc_hip.event_record(event, queue)));
-    }
     pthread_mutex_lock(&osc_runtime_lock);
     struct osc_event *event = osc_event_find(handle);
     pthread_mutex_unlock(&osc_runtime_lock);
@@ -1171,11 +836,6 @@ cudaError_t cudaEventRecord(cudaEvent_t handle, cudaStream_t stream)
 
 cudaError_t cudaEventSynchronize(cudaEvent_t handle)
 {
-    if (osc_uses_amd()) {
-        void *event = osc_native_event(handle);
-        return osc_result(event ? osc_from_hip(osc_hip.event_sync(event)) :
-                          cudaErrorInvalidResourceHandle);
-    }
     pthread_mutex_lock(&osc_runtime_lock);
     struct osc_event *event = osc_event_find(handle);
     if (!event) {
@@ -1193,11 +853,6 @@ cudaError_t cudaEventSynchronize(cudaEvent_t handle)
 
 cudaError_t cudaEventQuery(cudaEvent_t handle)
 {
-    if (osc_uses_amd()) {
-        void *event = osc_native_event(handle);
-        return osc_result(event ? osc_from_hip(osc_hip.event_query(event)) :
-                          cudaErrorInvalidResourceHandle);
-    }
     pthread_mutex_lock(&osc_runtime_lock);
     struct osc_event *event = osc_event_find(handle);
     if (!event) {
@@ -1216,12 +871,6 @@ cudaError_t cudaEventElapsedTime(float *milliseconds, cudaEvent_t start_handle, 
     if (!milliseconds)
         return osc_result(cudaErrorInvalidValue);
 
-    if (osc_uses_amd()) {
-        void *start = osc_native_event(start_handle), *end = osc_native_event(end_handle);
-        if (!start || !end)
-            return osc_result(cudaErrorInvalidResourceHandle);
-        return osc_result(osc_from_hip(osc_hip.event_elapsed_time(milliseconds, start, end)));
-    }
     pthread_mutex_lock(&osc_runtime_lock);
     struct osc_event *start = osc_event_find(start_handle);
     struct osc_event *end = osc_event_find(end_handle);
@@ -1263,110 +912,43 @@ const char *oscGetRuntimeName(void)
 
 oscBackend_t oscGetBackend(void)
 {
-    return osc_uses_amd() ? oscBackendAmdHip : oscBackendCpu;
+    return osc_uses_intel() ? oscBackendIntelLevelZero : oscBackendCpu;
 }
 
 const char *oscGetBackendName(void)
 {
-    return osc_uses_amd() ? "AMD HIP" : "CPU";
+    return osc_uses_intel() ? "Intel Level Zero" : "CPU";
 }
 
-cudaError_t oscGetDeviceArch(int device, char *arch, size_t capacity)
+cudaError_t oscIntelGetMemoryInfo(oscIntelMemoryInfo_t *info)
 {
-    if (!arch || !capacity)
-        return osc_result(cudaErrorInvalidValue);
-    arch[0] = '\0';
-#if defined(__linux__) && UINTPTR_MAX == UINT64_MAX
-    if (!osc_uses_amd())
-        return osc_result(cudaErrorNotSupported);
+    return osc_result(osc_intel_get_memory_info(info));
+}
 
-    // gcnArchName in the versioned HIP R0600 LP64 device properties ABI.
-    enum { arch_offset = 1160, arch_capacity = 256 };
-    union {
-        max_align_t alignment;
-        unsigned char bytes[4096];
-    } storage = {0};
-    int status = osc_hip.get_device_properties_r0600(storage.bytes, device);
-    osc_log_hip("hipGetDevicePropertiesR0600", status);
-    if (status)
-        return osc_result(osc_from_hip(status));
-    const char *name = (const char *)storage.bytes + arch_offset;
-    const char *end = memchr(name, '\0', arch_capacity);
-    if (!end || strncmp(name, "gfx", 3) || !name[3])
-        return osc_result(cudaErrorNotSupported);
-    size_t size = (size_t)(end - name) + 1;
-    if (size > capacity)
-        return osc_result(cudaErrorInvalidValue);
-    memcpy(arch, name, size);
-    return osc_result(cudaSuccess);
-#else
-    (void)device;
-    return osc_result(cudaErrorNotSupported);
-#endif
+cudaError_t oscIntelSetMemoryBudget(size_t bytes)
+{
+    return osc_result(osc_intel_set_memory_budget(bytes));
 }
 
 cudaError_t oscModuleLoad(oscModule_t *module, const char *path)
 {
     if (!module || !path)
         return osc_result(cudaErrorInvalidValue);
-    if (!osc_uses_amd())
-        return osc_result(cudaErrorNotSupported);
-    void *native_module = NULL;
-    int status = osc_hip.module_load(&native_module, path);
-    osc_log_hip("hipModuleLoad", status);
-    cudaError_t error = osc_from_hip(status);
-    if (error == cudaSuccess)
-        *module = (oscModule_t)native_module;
-    return osc_result(error);
+    return osc_result(cudaErrorNotSupported);
 }
 
 cudaError_t oscModuleUnload(oscModule_t module)
 {
     if (!module)
         return osc_result(cudaErrorInvalidValue);
-    if (!osc_uses_amd())
-        return osc_result(cudaErrorNotSupported);
-    cudaError_t error = osc_from_hip(osc_hip.device_synchronize());
-    cudaError_t unloaded = osc_from_hip(osc_hip.module_unload((void *)module));
-    return osc_result(error == cudaSuccess ? unloaded : error);
+    return osc_result(cudaErrorNotSupported);
 }
 
 cudaError_t oscModuleGetFunction(oscFunction_t *function, oscModule_t module, const char *name)
 {
     if (!function || !module || !name)
         return osc_result(cudaErrorInvalidValue);
-    if (!osc_uses_amd())
-        return osc_result(cudaErrorNotSupported);
-    void *native_function = NULL;
-    int status = osc_hip.module_get_function(&native_function, (void *)module, name);
-    osc_log_hip("hipModuleGetFunction", status);
-    cudaError_t error = osc_from_hip(status);
-    if (error == cudaSuccess)
-        *function = (oscFunction_t)native_function;
-    return osc_result(error);
-}
-
-cudaError_t oscLaunchKernelOnHipStream(oscFunction_t function, dim3 grid, dim3 block,
-                                      unsigned int shared, void **arguments, void *hip_stream)
-{
-    if (!function || !grid.x || !grid.y || !grid.z || !block.x || !block.y || !block.z)
-        return osc_result(cudaErrorInvalidValue);
-    if (!osc_uses_amd())
-        return osc_result(cudaErrorNotSupported);
-    int result = osc_hip.module_launch_kernel(
-        (void *)function, grid.x, grid.y, grid.z, block.x, block.y, block.z,
-        shared, hip_stream, arguments, NULL);
-    osc_log_hip("hipModuleLaunchKernel", result);
-    return osc_result(osc_from_hip(result));
-}
-
-cudaError_t osc_launch_kernel(oscFunction_t function, dim3 grid, dim3 block,
-                              unsigned int shared, void **arguments, cudaStream_t stream)
-{
-    void *native;
-    if (!osc_native_stream(stream, &native))
-        return osc_result(cudaErrorInvalidResourceHandle);
-    return oscLaunchKernelOnHipStream(function, grid, block, shared, arguments, native);
+    return osc_result(cudaErrorNotSupported);
 }
 
 cudaError_t oscLaunchKernel(oscFunction_t function,
@@ -1374,8 +956,9 @@ cudaError_t oscLaunchKernel(oscFunction_t function,
                             unsigned int block_x, unsigned int block_y, unsigned int block_z,
                             unsigned int shared_memory_bytes, void **arguments)
 {
-    cudaError_t result = osc_launch_kernel(function, (dim3){grid_x, grid_y, grid_z},
-                                           (dim3){block_x, block_y, block_z},
-                                           shared_memory_bytes, arguments, NULL);
-    return result == cudaSuccess ? cudaStreamSynchronize(NULL) : result;
+    if (!function || !grid_x || !grid_y || !grid_z || !block_x || !block_y || !block_z)
+        return osc_result(cudaErrorInvalidValue);
+    (void)shared_memory_bytes;
+    (void)arguments;
+    return osc_result(cudaErrorNotSupported);
 }

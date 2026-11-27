@@ -2,86 +2,69 @@
 
 ![OSCDA banner](docs/oscda-banner.png)
 
-> [!IMPORTANT]
-> **OSCDA is extremely experimental.** If you want a practical, working solution
-> for running existing CUDA applications on non-NVIDIA GPUs, we strongly
-> recommend [ZLUDA](https://github.com/vosen/ZLUDA).
+OSCDA (Open Source Compute Device Architecture) is an experimental CUDA
+compatibility runtime for **Intel GPUs on Linux**. Starting with version 0.3.0,
+Intel is the project's sole hardware focus. [ZLUDA](https://github.com/vosen/ZLUDA)
+already provides a strong AMD path; OSCDA instead targets Intel integrated and discrete GPUs, where Linux AI
+users still face memory pressure, driver instability, and limited CUDA-oriented
+tooling.
 
-OSCDA (Open Source Compute Device Architecture), formerly UniWarp, is an
-experimental CUDA compatibility runtime and PTX translator for AMD GPUs on
-Linux. It is intended for any application whose kernels and runtime
-requirements fit the supported subset. The current version is **0.2.5**.
+> [!WARNING]
+> OSCDA is extremely experimental. It is developed independently in the
+> maintainer's free time, without any compatibility, stability, performance, or
+> support guarantee. Do not use it for production or safety-critical workloads.
 
-The [Rust HIP interface](rust/oscda-hip/README.md) loads named kernels from
-AMDGPU code objects and launches them on streams owned by the application or
-its framework. Applio served as an integration test for real AI inference.
-The standalone Rust vector-add example exercises the same interface without
-an application framework.
+The project is independent of Intel, NVIDIA, AMD, and ZLUDA. CUDA is an NVIDIA
+trademark.
 
-## Platform policy
+## Status
 
-**Linux is the project's sole development and validation target.** The current
-hardware reference is the Radeon RX 6600 (`gfx1032`). Compatibility with other
-AMD GPUs depends on the ROCm runtime, compiler, and kernel features.
+Version **0.3.0** begins the Intel migration with a native Linux Level Zero
+backend. It currently provides:
 
-Windows code and an experimental probe remain available for independent
-testing. A Windows cross-build or a Wine/VM pass does not establish native GPU
-compatibility. Windows results are unverified and are not release criteria.
-Contributors are welcome to audit the code, run individual tests on their own
-Windows systems, and submit pull requests with reproducible results.
+- Intel GPU discovery through the standard `libze_loader` interface;
+- CUDA-compatible device queries, allocation, free, copy, and memset;
+- shared allocations on integrated GPUs to avoid an unnecessary host/device
+  duplicate, and device-local allocations on discrete GPUs;
+- a conservative per-process memory budget that rejects allocations before the
+  driver reaches severe memory pressure;
+- finite command timeouts, so a stalled GPU reports an error instead of making
+  the process wait forever;
+- runtime memory telemetry and a safe API for lowering or raising the budget;
+- a deterministic CPU backend and a mock Level Zero driver for regression tests.
 
-## Changes
+CUDA kernel execution is **not implemented yet** on the Intel backend.
+`cudaLaunchKernel`, module loading, CUDA libraries, PyTorch CUDA wheels, and AI
+framework compatibility remain future work. The next compiler milestone is a
+PTX-to-SPIR-V path and Level Zero module/kernel execution. The former AMDGPU/HIP
+translator and backend were removed rather than presented as Intel-compatible.
 
-**0.2.5** exposes a general Rust API and C ABI for loading and launching named
-AMDGPU kernels with caller-supplied arguments, grid and block dimensions,
-dynamic shared memory, and a borrowed HIP stream. The original ReLU ABI is
-still available. On the RX 6600, the standalone Rust example matched all
-4,099 CPU results, and Applio matched all 281,600 samples of the native ROCm
-reference using the same general interface.
+## Why Level Zero
 
-**0.2.4** adds a Rust bridge for running translated PTX kernels on tensors and
-streams owned by PyTorch ROCm. LLVM generates AMDGPU code objects as before.
-The [Applio validation](docs/applio-validation.md) exercises the ReLU operator
-inside an actual RVC inference run on the RX 6600 and compares the resulting WAV
-with native ROCm inference.
+OSCDA follows the architecture proven by ZLUDA's former Intel backend: use
+Intel's low-level Level Zero API for contexts, memory, command lists, and later
+SPIR-V modules. The implementation was independently adapted to OSCDA's small C
+runtime and adds explicit memory budgeting and bounded waits.
 
-**0.2.3** detects the selected HIP device's AMD target on 64-bit Linux and
-loads only the PTX entry requested by each launch. Fatbins can contain several
-PTX images or several entries in one image. The runtime caches successful
-translations per kernel and device. Explicit streams can depend on each other
-through `cudaStreamWaitEvent` on HIP. A shared CUDA library runs FP32 matrix
-multiplication followed by ReLU on two streams and checks both runs against the
-CPU on the RX 6600.
+Driver research is limited to public, legal interfaces: the open-source
+[Intel Compute Runtime](https://github.com/intel/compute-runtime), the published
+[Level Zero specification](https://oneapi-src.github.io/level-zero-spec/), and
+the Linux [`i915` and `xe` DRM UAPI](https://www.kernel.org/doc/html/latest/gpu/driver-uapi.html).
+OSCDA does not include proprietary Intel code and does not
+bypass firmware signatures, kernel security, or device protections.
 
-**0.2.2** submits CUDA kernel launches on explicit streams to native HIP
-queues. Copies, fills, callbacks, and events share the same queue ordering.
-The Linux RX 6600 test verifies that one stream can finish while another is
-held, and checks 4,099 results from each stream.
+## Requirements
 
-**0.2.1** supports LZ4- and Zstandard-compressed PTX in CUDA fatbins, including
-the automatic launch path for CUDA executables with embedded PTX on Linux.
+- Linux and CMake 3.20 or newer;
+- a C11 compiler and pthreads;
+- the Level Zero loader (`libze_loader.so.1`);
+- Intel Compute Runtime with access to an Intel `/dev/dri/renderD*` node.
 
-**0.2.0** introduced the following features.
+The Intel Compute Runtime supports both integrated Intel graphics and discrete
+Arc GPUs. OSCDA loads Level Zero dynamically, so the project still builds and
+its CPU tests run on machines without Intel hardware.
 
-- Added the HIP backend for AMD device discovery, memory, and AMDGPU module
-  launches. Retained a deterministic CPU backend for host-side tests.
-- Added `osc-ptx` for text PTX, PTX inside CUDA fatbins, and
-  little-endian ELF64 files with a `.nv_fatbin` section.
-- Added translation for scalar arithmetic, direct branches, static shared FP32
-  memory, and full-workgroup `bar.sync 0` barriers.
-- Added automatic registration of compiler-generated CUDA fatbins and launch
-  through `cudaLaunchKernel`. OSC translates on first use and caches the
-  loaded module per device for that process.
-- Added optional HIP diagnostics and regression coverage for invalid tracked
-  memory ranges.
-
-## Build and test on Linux
-
-Use CMake 3.20+, a C11 compiler, and a build tool. Python 3 enables the PTX
-tests. GPU execution requires the AMDGPU driver, access to `/dev/kfd` and the
-AMD render node under `/dev/dri`, and a working ROCm HIP runtime. Translation
-also requires ROCm LLVM Clang. Install `liblz4.so.1` or `libzstd.so.1`
-for the compression formats you use. The reference toolchain is HIP 6.4 and LLVM 19.
+## Build and test
 
 ```sh
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
@@ -89,141 +72,62 @@ cmake --build build
 ctest --test-dir build --output-on-failure
 ```
 
-The GPU test is skipped when HIP reports no usable device. Use
-`OSC_HIP_DIAGNOSTICS=1 ./build/amd_runtime_test` to see the native HIP status.
-Set `OSC_HIP_LIBRARY` to test a specific HIP shared library, or
-`OSC_BACKEND=cpu` to force the CPU backend.
+The `intel_runtime` test uses a mock loader and validates selection, memory
+accounting, copies, fills, and configuration without requiring an Intel GPU.
+Real-hardware validation is still required before reporting a device as tested.
 
-Use `#include <osc/osc.h>` for native OSC APIs or `#include <cuda_runtime.h>`
-for the compatibility subset. Link with `-losc`. To install the library,
-headers, and `osc-ptx`:
+Use `#include <osc/osc.h>` for OSCDA extensions or
+`#include <cuda_runtime.h>` for the CUDA compatibility subset. Link with
+`-losc`.
 
-```sh
-cmake --install build --prefix /path/to/prefix
+## Memory and hang controls
+
+OSCDA reserves memory by default instead of exposing the entire physical pool:
+
+- integrated GPU: reserves at least 512 MiB and caps the budget at half of the
+  currently available host RAM;
+- discrete GPU: reserves at least 256 MiB and otherwise keeps 10% of VRAM free.
+
+The policy is intentionally conservative because an iGPU competes with the CPU
+for system memory, while a dGPU can become unstable under VRAM exhaustion.
+
+Environment variables:
+
+| Variable | Purpose |
+| --- | --- |
+| `OSC_BACKEND=cpu` | Force the deterministic CPU backend. |
+| `OSC_INTEL_DEVICE=N` | Select the Nth Intel GPU reported by Level Zero. |
+| `OSC_INTEL_MEMORY_BUDGET_MB=N` | Override the initial OSCDA allocation budget. It cannot exceed reported physical memory. |
+| `OSC_INTEL_TIMEOUT_MS=N` | Set the command completion timeout; default is 30000 ms. |
+| `OSC_LEVEL_ZERO_LIBRARY=/path/libze_loader.so.1` | Test a specific Level Zero loader. |
+
+Applications can inspect and adjust the live policy:
+
+```c
+oscIntelMemoryInfo_t info;
+if (oscIntelGetMemoryInfo(&info) == cudaSuccess) {
+    /* A new budget may not be below allocatedBytes or above physicalBytes. */
+    oscIntelSetMemoryBudget(info.budgetBytes);
+}
 ```
 
-## Run a translated kernel
-
-Set `OSC_CLANG` to the ROCm compiler if it is outside PATH. Replace
-`gfx1032` with the target reported by `amdgpu-arch` for your GPU.
-
-```sh
-export OSC_CLANG=/path/to/rocm/llvm/bin/clang++
-python3 tools/osc_ptx.py examples/vector_add.ptx --arch gfx1032 -o build/vector_add.hsaco
-./build/amd_vector_add build/vector_add.hsaco
-python3 tools/osc_ptx.py examples/matmul.ptx --arch gfx1032 -o build/matmul.hsaco
-./build/amd_matmul build/matmul.hsaco
-```
-
-The vector test compares 4,099 results and checks the last block's padding.
-The tiled matrix test compares 2,097 FP32 outputs against CPU results across
-aligned and irregular dimensions. Both were validated on the RX 6600.
-
-The translator accepts textual PTX `.entry` definitions with 64-bit addressing
-and scalar arguments. Use `--kernel NAME` to select one entry from a PTX
-file, fatbin, or supported ELF. Kernel-local static FP32 arrays map to AMD
-LDS. Every thread in a workgroup must reach each barrier instance. The frontend
-validates branch targets and definite register initialization. Unsupported
-instructions, unsupported compression formats, cubin-only images, and ambiguous fatbins
-fail explicitly. See the [PTX ISA](https://docs.nvidia.com/cuda/parallel-thread-execution/index.html)
-and [LLVM AMDGPU guide](https://llvm.org/docs/AMDGPUUsage.html).
-
-## Run a CUDA executable with embedded PTX
-
-This example embeds the supplied PTX with NVIDIA's `nvFatbin` and compiles the
-CUDA host stub with Clang. NVIDIA's library is required only to build this
-fixture. At runtime OSC extracts and translates the embedded PTX automatically.
-
-```sh
-python3 examples/pack_cuda_ptx.py /path/to/libnvfatbin.so.12 build/vector_add.fatbin --compression speed
-"$OSC_CLANG" -x cuda --cuda-host-only -nocudainc -nocudalib -std=c++17 -Iinclude \
-  -Xclang -target-sdk-version=12.0 -Xclang -fcuda-include-gpubinary \
-  -Xclang build/vector_add.fatbin -c examples/cuda_vector_add.cu -o build/cuda_vector_add.o
-c++ build/cuda_vector_add.o -Lbuild -Wl,-rpath,"$PWD/build" -losc -o build/cuda_vector_add
-OSC_PTX_TOOL="$PWD/tools/osc_ptx.py" ./build/cuda_vector_add
-```
-
-Expected on the RX 6600: two CUDA launches with 4,099 correct results each.
-The LZ4 example above uses nvFatbin 12.9. For Zstandard, use nvFatbin 13.5
-(`libnvfatbin.so.13`) with `--compression balance`.
-Default-stream launches remain synchronous. With an explicit stream, the
-launch returns after submission. The first launch can still spend time
-translating and loading the embedded module. Use `cudaStreamSynchronize`
-or an event to wait for completion. On HIP, `cudaMallocHost` provides pinned
-buffers for asynchronous host and device transfers.
-`OSC_PYTHON` selects the Python executable when needed. An installed `osc-ptx`
-on PATH can replace `OSC_PTX_TOOL`.
-
-OSC implements the registration path observed in NVIDIA's CUDA runtime and
-in [Clang's CUDA code generation](https://clang.llvm.org/doxygen/CGCUDANV_8cpp_source.html).
-For a manual launch, use `oscModuleLoad`, `oscModuleGetFunction`, and
-`oscLaunchKernel` with a compiled AMDGPU code object.
-
-### Validate two CUDA streams
-
-Reuse the compressed `build/vector_add.fatbin` from the previous example:
-
-```sh
-"$OSC_CLANG" -x cuda --cuda-host-only -nocudainc -nocudalib -std=c++17 -Iinclude \
-  -Xclang -target-sdk-version=12.0 -Xclang -fcuda-include-gpubinary \
-  -Xclang build/vector_add.fatbin -c examples/cuda_two_streams.cu -o build/cuda_two_streams.o
-c++ build/cuda_two_streams.o -Lbuild -Wl,-rpath,"$PWD/build" -losc -pthread -o build/cuda_two_streams
-OSC_PTX_TOOL="$PWD/tools/osc_ptx.py" ./build/cuda_two_streams
-```
-
-The program holds a non-blocking stream with a host callback and waits for
-the second stream's event before releasing the first. It then checks both
-outputs. This verifies independent progress and ordering, without requiring
-that the GPU execute two kernels simultaneously.
-
-### Validate a shared CUDA library
-
-Build a CUDA shared library with two Zstandard-compressed PTX images using
-nvFatbin 13.5. A Python process loads the library and invokes its host function.
-No NVIDIA library is needed while running it.
-
-```sh
-python3 examples/pack_cuda_ptx.py /path/to/libnvfatbin.so.13 build/inference.fatbin \
-  --compression balance --ptx examples/matmul.ptx --ptx examples/relu.ptx
-"$OSC_CLANG" -x cuda --cuda-host-only -nocudainc -nocudalib -std=c++17 -fPIC -Iinclude \
-  -Xclang -target-sdk-version=12.0 -Xclang -fcuda-include-gpubinary \
-  -Xclang build/inference.fatbin -c examples/cuda_inference.cu -o build/cuda_inference.o
-c++ -shared -Wl,-z,defs build/cuda_inference.o -Lbuild -Wl,-rpath,'$ORIGIN' -losc \
-  -o build/cuda_inference.so
-OSC_PTX_TOOL="$PWD/tools/osc_ptx.py" python3 -c \
-  'import ctypes, sys; sys.exit(ctypes.CDLL(sys.argv[1]).osc_inference_test())' \
-  "$PWD/build/cuda_inference.so"
-```
-
-Expected on the RX 6600: `gfx1032: two MatMul + ReLU passes, 437 exact CPU
-matches each`. The consumer stream waits for the producer's event before
-running ReLU and copying results back. There is one host synchronization per
-pass, after both kernels and the result copy.
-
-If the HIP backend is unavailable, rerun with `OSC_HIP_DIAGNOSTICS=1`.
-The log distinguishes HIP discovery, target detection, code-object loading,
-and kernel enqueue failures. Translation errors include the entry and target.
-`OSC_GPU_ARCH` overrides auto-detection if needed. The GPU target detected by
-HIP describes the device ISA. Consult the
-[AMD ROCm compatibility matrix](https://rocm.docs.amd.com/en/latest/compatibility/compatibility-matrix.html)
-for AMD's separate hardware and software support policy.
-
-## Compatibility limits
-
-The runtime implements a subset of CUDA host APIs. Entry selection requires a
-unique matching PTX entry in the fatbin. PTX modules with calls to device
-functions or module-scope data declarations are outside the translator subset.
-CUDA C++ device compilation,
-SASS translation, general CUDA binary compatibility, CUDA graphs, and NVIDIA
-libraries such as cuBLAS and cuDNN are outside the current scope. PyTorch CUDA
-wheels are outside the validated scope. The Applio validation uses native
-PyTorch ROCm for the rest of the model and OSCDA for the documented operator.
+If a Level Zero command times out or the device is lost, OSCDA marks that
+backend instance as stalled and rejects subsequent work. Automatic GPU reset is
+deliberately excluded: resetting `i915` or `xe` can disrupt the desktop and
+other processes, and belongs in privileged system tooling rather than a CUDA
+compatibility library.
 
 ## Contributing
 
-Use a pull request for changes. For GPU results, include the GPU and target ID,
-OS and driver versions, HIP and Clang versions, exact commands, and logs.
-Keep platform-specific results separate from Linux validation.
+Use a pull request. For real Intel GPU results, include:
 
-OSCDA is independent of AMD and NVIDIA. CUDA is an NVIDIA trademark.
+- GPU model and PCI ID;
+- integrated or discrete classification;
+- Linux kernel version and whether the device uses `i915` or `xe`;
+- Intel Compute Runtime and Level Zero loader versions;
+- exact commands, memory budget, timeout, and complete logs.
+
+Please keep claims reproducible and clearly label mock-only or CPU-only results.
+OSCDA is a free-time project, so reviews and releases may be irregular.
+
 Released under the [MIT License](LICENSE).

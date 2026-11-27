@@ -1,6 +1,10 @@
 cmake_minimum_required(VERSION 3.20)
 
-project(OSCDA VERSION 0.2.5 LANGUAGES C)
+project(OSCDA VERSION 0.3.0 LANGUAGES C)
+
+if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    message(FATAL_ERROR "OSCDA's Intel backend currently supports Linux only")
+endif()
 
 include(GNUInstallDirs)
 include(CTest)
@@ -8,7 +12,7 @@ if(NOT MINGW)
     find_package(Threads REQUIRED)
 endif()
 
-add_library(osc SHARED src/runtime.c src/cuda_registration.c)
+add_library(osc SHARED src/runtime.c src/intel_backend.c src/cuda_registration.c)
 target_compile_features(osc PUBLIC c_std_11)
 target_compile_definitions(osc PRIVATE OSCDA_BUILD)
 target_compile_options(osc PRIVATE -Wall -Wextra -Wpedantic -Werror)
@@ -28,14 +32,6 @@ set_target_properties(osc PROPERTIES
     SOVERSION ${PROJECT_VERSION_MAJOR}
 )
 
-add_executable(amd_vector_add examples/amd_vector_add.c)
-target_compile_options(amd_vector_add PRIVATE -Wall -Wextra -Wpedantic -Werror)
-target_link_libraries(amd_vector_add PRIVATE osc)
-
-add_executable(amd_matmul examples/amd_matmul.c)
-target_compile_options(amd_matmul PRIVATE -Wall -Wextra -Wpedantic -Werror)
-target_link_libraries(amd_matmul PRIVATE osc)
-
 if(BUILD_TESTING)
     add_executable(runtime_test tests/runtime_test.c)
     target_compile_options(runtime_test PRIVATE -Wall -Wextra -Wpedantic -Werror)
@@ -48,17 +44,29 @@ if(BUILD_TESTING)
     target_link_libraries(cuda_registration_test PRIVATE osc)
     add_test(NAME cuda_registration COMMAND cuda_registration_test)
 
-    add_executable(amd_runtime_test tests/amd_runtime_test.c)
-    target_compile_options(amd_runtime_test PRIVATE -Wall -Wextra -Wpedantic -Werror)
-    target_link_libraries(amd_runtime_test PRIVATE osc)
-    add_test(NAME amd_runtime COMMAND amd_runtime_test)
-    set_tests_properties(amd_runtime PROPERTIES SKIP_RETURN_CODE 77)
+    if(UNIX)
+        add_library(mock_level_zero SHARED tests/mock_level_zero.c)
+        target_compile_options(mock_level_zero PRIVATE -Wall -Wextra -Wpedantic -Werror)
 
-    find_package(Python3 COMPONENTS Interpreter QUIET)
-    if(Python3_Interpreter_FOUND)
-        add_test(NAME ptx_frontend COMMAND ${Python3_EXECUTABLE} -B
-            "${CMAKE_CURRENT_SOURCE_DIR}/tests/ptx_test.py")
+        add_executable(intel_runtime_test tests/intel_runtime_test.c)
+        target_compile_options(intel_runtime_test PRIVATE -Wall -Wextra -Wpedantic -Werror)
+        target_link_libraries(intel_runtime_test PRIVATE osc)
+        add_test(NAME intel_runtime COMMAND intel_runtime_test)
+        set_tests_properties(intel_runtime PROPERTIES ENVIRONMENT
+            "OSC_LEVEL_ZERO_LIBRARY=$<TARGET_FILE:mock_level_zero>;OSC_INTEL_MEMORY_BUDGET_MB=64;OSC_INTEL_TIMEOUT_MS=25")
+
+        add_test(NAME intel_runtime_discrete COMMAND intel_runtime_test discrete)
+        set_tests_properties(intel_runtime_discrete PROPERTIES ENVIRONMENT
+            "OSC_LEVEL_ZERO_LIBRARY=$<TARGET_FILE:mock_level_zero>;OSC_INTEL_MEMORY_BUDGET_MB=64;OSC_INTEL_TIMEOUT_MS=25;MOCK_ZE_DISCRETE=1")
+
+        add_executable(intel_timeout_test tests/intel_timeout_test.c)
+        target_compile_options(intel_timeout_test PRIVATE -Wall -Wextra -Wpedantic -Werror)
+        target_link_libraries(intel_timeout_test PRIVATE osc)
+        add_test(NAME intel_timeout COMMAND intel_timeout_test)
+        set_tests_properties(intel_timeout PROPERTIES ENVIRONMENT
+            "OSC_LEVEL_ZERO_LIBRARY=$<TARGET_FILE:mock_level_zero>;OSC_INTEL_MEMORY_BUDGET_MB=64;OSC_INTEL_TIMEOUT_MS=1;MOCK_ZE_TIMEOUT=1")
     endif()
+
 endif()
 
 install(TARGETS osc
@@ -68,7 +76,6 @@ install(TARGETS osc
     RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
 )
 install(DIRECTORY include/ DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
-install(PROGRAMS tools/osc_ptx.py DESTINATION ${CMAKE_INSTALL_BINDIR} RENAME osc-ptx)
 install(EXPORT OSCDATargets
     FILE OSCDATargets.cmake
     NAMESPACE OSC::
